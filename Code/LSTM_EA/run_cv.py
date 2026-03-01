@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 import logging
@@ -59,6 +59,8 @@ class CVConfig:
     seed: int = 42
     model_type: str = "LSTM"  # "EALSTM" or "LSTM"
     num_layers: int = 3  # LSTM layers (only used when model_type="LSTM")
+    val_fraction: float = 0.15  # fraction of training data held out for validation (early stopping / LR scheduling)
+    year_range: Tuple[int, int] = (2017, 2024)  # restrict experiment data to this year range (inclusive)
 
     # Presto embeddings as static features (added to Alpha Earth when True)
     use_presto_static: bool = True
@@ -123,7 +125,8 @@ def run_single_fold(
         seq_length=config.seq_length,
         nan_threshold=config.nan_threshold,
         same_year_constraint=True,
-        month_range=(5, 10),  # May–October only
+        month_range=(1, 12),  # May–October only
+        year_range=config.year_range,
     )
 
     # Resolve Presto embeddings path (relative to LSTM_EA project root)
@@ -169,11 +172,24 @@ def run_single_fold(
     data = processor.prepare_data(data_config.train_files, data_config.test_files)
     
     # Create datasets
-    train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'])
+    full_train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'])
     test_dataset = RZSMDataset(data['X_d_test'], data['X_s_test'], data['y_test'])
     
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    # Split training data into train/val to prevent data leakage.
+    # Early stopping, LR scheduling, and model selection use val_loader
+    # (a held-out portion of training stations), NOT the test station.
+    val_size = int(len(full_train_dataset) * config.val_fraction)
+    train_size = len(full_train_dataset) - val_size
+    train_subset, val_subset = random_split(
+        full_train_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed),
+    )
+    
+    train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=config.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    
+    logger.info(f"Train/Val/Test split: {train_size} / {val_size} / {len(test_dataset)} samples")
     
     # Get dimensions
     dyn_dim = data['X_d_train'].shape[2]
@@ -190,8 +206,8 @@ def run_single_fold(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     trainer = Trainer(model, training_config, str(fold_output_dir), device=str(device))
     
-    logger.info("Training...")
-    history = trainer.train(train_loader, test_loader)
+    logger.info("Training (val_loader from training stations, test station held out)...")
+    history = trainer.train(train_loader, val_loader)
     
     # Evaluate
     logger.info("Evaluating...")
@@ -211,7 +227,8 @@ def run_single_fold(
         'y_pred': y_pred,
         'y_true': y_true,
         'metrics': metrics,
-        'history': history
+        'history': history,
+        'dates_test': data.get('dates_test'),
     }
 
 
@@ -319,6 +336,7 @@ def main():
     log.info(f"Model: {config.model_type}")
     log.info(f"Stations: {list(STATIONS.keys())}")
     log.info(f"Number of folds: {len(CV_FOLDS)}")
+    log.info(f"Year range: {config.year_range[0]}–{config.year_range[1]} (inclusive)")
     log.info("Data: May–November only (month_range=(5, 11))")
     if config.use_presto_static:
         presto_path = Path(config.presto_embeddings_path)
