@@ -618,10 +618,12 @@ class DataProcessor:
                 self.scaler_dyn.fit(train_concat[dynamic_cols].dropna())
                 
                 # Static scaler: when Presto daily merged, static_cols include emb_* and are in train_concat
+                # Skip when no static columns (e.g. meteo_precip_only with empty static_cols)
                 static_cols_for_scaling = static_cols.copy()
                 if irrigation_as_static and 'irrigation' in train_concat.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
-                self.scaler_stat.fit(train_concat[static_cols_for_scaling].dropna())
+                if static_cols_for_scaling:
+                    self.scaler_stat.fit(train_concat[static_cols_for_scaling].dropna())
                 
                 self.scaler_y.fit(train_concat[[target_col]].dropna())
                 
@@ -642,8 +644,9 @@ class DataProcessor:
                 if irrigation_as_static and 'irrigation' in df.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 # Fill NaN in static (e.g. Presto merge misses) so scaler.transform does not fail
-                static_vals = df[static_cols_for_scaling].fillna(0.0)
-                df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                if static_cols_for_scaling:
+                    static_vals = df[static_cols_for_scaling].fillna(0.0)
+                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 xd, xs, y = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col)
@@ -669,8 +672,9 @@ class DataProcessor:
                 static_cols_for_scaling = static_cols.copy()
                 if irrigation_as_static and 'irrigation' in df.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
-                static_vals = df[static_cols_for_scaling].fillna(0.0)
-                df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                if static_cols_for_scaling:
+                    static_vals = df[static_cols_for_scaling].fillna(0.0)
+                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)

@@ -39,22 +39,22 @@ from utils.logging_utils import setup_logging
 ALL_DYNAMIC = [
     'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1',
     'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I',
-    'TA_1_1_1', 'RH_1_1_1',
+    'TA_1_1_1', 'RH_1_1_1', 'LE_1_1_1', 'NETRAD_1_1_1',
     'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a',
 ]
 
 SSM_FEATURES = {'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1'}
 PRECIP_FEATURES_DYN = {'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I'}
 PRECIP_FEATURES_STAT = {'precip_jan_apr', 'precip_may_oct'}
-METEO_FEATURES = {'TA_1_1_1', 'RH_1_1_1'}
+METEO_FEATURES = {'TA_1_1_1', 'RH_1_1_1', 'LE_1_1_1', 'NETRAD_1_1_1'}
 S2_FEATURES = {'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a'}
 AE_FEATURES = {f'A{i:02d}' for i in range(64)}
 PRESTO_FEATURES = {f'emb_{k}' for k in range(128)}
 
 
 def _static_cols(use_presto: bool, exclude_ae: bool = False,
-                 exclude_precip: bool = False, exclude_presto: bool = False):
-    """Build the static_cols list given ablation flags."""
+                 exclude_precip: bool = True, exclude_presto: bool = False):
+    """Build the static_cols list given ablation flags. Default exclude_precip=True to avoid future-value leakage."""
     cols: List[str] = []
     if use_presto and not exclude_presto:
         cols += [f'emb_{k}' for k in range(128)]
@@ -78,6 +78,15 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
+    # 1b. Baseline without temporal (doy) features
+    experiments['baseline_no_doy'] = dict(
+        description='All features (baseline) without temporal features (doy_sin, doy_cos)',
+        dynamic_cols=list(ALL_DYNAMIC),
+        static_cols=_static_cols(use_presto=True),
+        use_presto_static=True,
+        exclude_irrigation_static=False,
+    )
+
     # 2. No SSM
     experiments['no_ssm'] = dict(
         description='Remove SSM features',
@@ -91,7 +100,7 @@ def build_experiments() -> Dict[str, dict]:
     experiments['no_precip_irrig'] = dict(
         description='Remove precipitation & irrigation features',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in PRECIP_FEATURES_DYN],
-        static_cols=_static_cols(use_presto=True, exclude_precip=True),
+        static_cols=_static_cols(use_presto=True),
         use_presto_static=True,
         exclude_irrigation_static=True,
     )
@@ -201,7 +210,7 @@ def build_experiments() -> Dict[str, dict]:
     experiments['meteo_precip_only'] = dict(
         description='Only meteo + precip (physical drivers baseline / floor)',
         dynamic_cols=list(METEO_FEATURES | PRECIP_FEATURES_DYN),
-        static_cols=['precip_jan_apr', 'precip_may_oct'],
+        static_cols=[],
         use_presto_static=False,
         exclude_irrigation_static=True,
     )
@@ -210,9 +219,36 @@ def build_experiments() -> Dict[str, dict]:
     experiments['no_ssm_no_precip'] = dict(
         description='Remove SSM and all precip/irrigation features',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | PRECIP_FEATURES_DYN],
-        static_cols=_static_cols(use_presto=True, exclude_precip=True),
+        static_cols=_static_cols(use_presto=True),
         use_presto_static=True,
         exclude_irrigation_static=True,
+    )
+
+    # 17. No SSM + No Presto + No S2 + No irrigation (keep Alpha Earth, meteo, precip)
+    experiments['no_ssm_no_presto_no_s2_no_irrigation'] = dict(
+        description='Remove SSM + Presto + S2 + irrigation (keep Alpha Earth, meteo, precip)',
+        dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
+        static_cols=_static_cols(use_presto=False),
+        use_presto_static=False,
+        exclude_irrigation_static=True,
+    )
+
+    # 18. No SSM + No Presto + No S2 + No Alpha Earth + No irrigation (meteo + precip dynamic only)
+    experiments['no_ssm_no_presto_no_s2_no_alpha_no_irrigation'] = dict(
+        description='Remove SSM + Presto + S2 + Alpha Earth + irrigation (meteo + precip only)',
+        dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
+        static_cols=_static_cols(use_presto=False, exclude_ae=True),
+        use_presto_static=False,
+        exclude_irrigation_static=True,
+    )
+
+    # 19. Meteo + precip + irrigation only (no SSM, S2, Presto, Alpha Earth; no static precip)
+    experiments['meteo_precip_irrig_only'] = dict(
+        description='Only meteo + precip + irrigation (dynamic); no static precip',
+        dynamic_cols=list(METEO_FEATURES | PRECIP_FEATURES_DYN),
+        static_cols=[],
+        use_presto_static=False,
+        exclude_irrigation_static=False,
     )
 
     return experiments
@@ -519,6 +555,9 @@ def main():
         config.static_cols = exp_cfg['static_cols']
         config.use_presto_static = exp_cfg['use_presto_static']
         config.output_dir = str(output_root / exp_name)
+        # Drop temporal features only for the baseline_no_doy experiment
+        if exp_name == 'baseline_no_doy':
+            config.add_temporal = False
 
         # Store the irrigation flag so FeatureConfig picks it up
         config._exclude_irrigation_static = exp_cfg['exclude_irrigation_static']
