@@ -5,7 +5,7 @@ Matches the logic from prep_data.py exactly.
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union, Sequence
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -511,11 +511,15 @@ class DataProcessor:
         self, 
         train_files: List[str], 
         test_files: List[str],
-        fit_scalers: bool = True
+        fit_scalers: bool = True,
+        val_years: Optional[Union[int, Sequence[int]]] = None,
     ) -> Dict:
         """
         Complete data preparation pipeline with comprehensive error handling.
-        
+
+        When val_years is set, scalers are fit only on training rows from other years
+        (so validation years are not used for scaling), avoiding leakage.
+
         Parameters
         ----------
         train_files : List[str]
@@ -524,13 +528,8 @@ class DataProcessor:
             List of test file paths (relative to data_dir)
         fit_scalers : bool
             Whether to fit scalers (True for new training, False for inference)
-        
-        Returns
-        -------
-        Dict
-            Dictionary containing:
-            - X_d_train, X_s_train, y_train: Training data
-            - X_d_test, X_s_test, y_test: Test data
+        val_years : int or sequence of int, optional
+            If set, fit scalers only on training data from years not in val_years.
         """
         
         logger.info("="*60)
@@ -615,7 +614,20 @@ class DataProcessor:
                             logger.warning(f"Found {inf_count} infinite values in {col}, replacing with NaN")
                             train_concat[col] = train_concat[col].replace([np.inf, -np.inf], np.nan)
                 
-                self.scaler_dyn.fit(train_concat[dynamic_cols].dropna())
+                # When val_years is set, fit scalers only on training data from other years (no leakage into val)
+                val_years_seq = (val_years,) if isinstance(val_years, int) else (val_years if val_years is not None else ())
+                if val_years_seq and 'Date' in train_concat.columns:
+                    val_years_set = set(val_years_seq)
+                    train_concat_fit = train_concat[~train_concat['Date'].dt.year.isin(val_years_set)]
+                    if len(train_concat_fit) == 0:
+                        logger.warning(f"No training rows left after excluding years {sorted(val_years_set)}, fitting on all training data")
+                        train_concat_fit = train_concat
+                    else:
+                        logger.info(f"Fitting scalers on training data excluding years {sorted(val_years_set)} ({len(train_concat_fit)} rows)")
+                else:
+                    train_concat_fit = train_concat
+                
+                self.scaler_dyn.fit(train_concat_fit[dynamic_cols].dropna())
                 
                 # Static scaler: when Presto daily merged, static_cols include emb_* and are in train_concat
                 # Skip when no static columns (e.g. meteo_precip_only with empty static_cols)
@@ -623,9 +635,9 @@ class DataProcessor:
                 if irrigation_as_static and 'irrigation' in train_concat.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 if static_cols_for_scaling:
-                    self.scaler_stat.fit(train_concat[static_cols_for_scaling].dropna())
+                    self.scaler_stat.fit(train_concat_fit[static_cols_for_scaling].dropna())
                 
-                self.scaler_y.fit(train_concat[[target_col]].dropna())
+                self.scaler_y.fit(train_concat_fit[[target_col]].dropna())
                 
                 logger.info("Scalers fitted successfully (StandardScaler - zero mean, unit variance)")
                 logger.info(f"  Target: mean={self.scaler_y.mean_[0]:.4f}, std={self.scaler_y.scale_[0]:.4f}")
@@ -635,7 +647,7 @@ class DataProcessor:
         
         # Process training data
         logger.info("\nProcessing training data...")
-        X_d_train_list, X_s_train_list, y_train_list = [], [], []
+        X_d_train_list, X_s_train_list, y_train_list, dates_train_list = [], [], [], []
         for i, df in enumerate(train_dfs):
             try:
                 df_scaled = df.copy()
@@ -649,11 +661,13 @@ class DataProcessor:
                     df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
-                xd, xs, y = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col)
+                out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)
+                xd, xs, y, dates = out[0], out[1], out[2], out[3]
                 if len(xd) > 0:
                     X_d_train_list.append(xd)
                     X_s_train_list.append(xs)
                     y_train_list.append(y)
+                    dates_train_list.append(dates)
                     logger.info(f"  File {i+1} ({train_files[i]}): {len(xd)} windows")
             except Exception as e:
                 logger.error(f"Error processing training file {i+1}: {e}", exc_info=True)
@@ -699,6 +713,7 @@ class DataProcessor:
             'X_d_test': np.concatenate(X_d_test_list),
             'X_s_test': np.concatenate(X_s_test_list),
             'y_test': np.concatenate(y_test_list),
+            'dates_train': np.concatenate(dates_train_list),
             'dates_test': np.concatenate(dates_test_list),
         }
         

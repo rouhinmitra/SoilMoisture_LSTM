@@ -14,9 +14,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Union, Sequence
 import logging
 
 from src.config import DataConfig, FeatureConfig, ModelConfig, TrainingConfig
@@ -40,26 +40,38 @@ CV_FOLDS = [
 ]
 
 
+def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R² (1 - SS_res/SS_tot). Returns np.nan if SS_tot is 0 or len < 2."""
+    if len(y_true) < 2:
+        return np.nan
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return np.nan
+    return float(1 - (ss_res / ss_tot))
+
+
 @dataclass
 class CVConfig:
     """Cross-validation configuration - TUNED (BEST: Mean R² = 0.67)"""
     data_dir: str = "/Users/rouhinmitra/SM_work/Data/Base/"
     output_dir: str = "outputs/cv_results_tuned"
-    seq_length: int = 15
+    seq_length: int = 20
     nan_threshold: float = 0.1
     # TUNED hyperparameters - best overall performance
-    hidden_dim: int = 128
-    dropout: float = 0.5
+    hidden_dim: int = 32
+    dropout: float = 0.50
     batch_size: int = 32
     epochs: int = 150
     learning_rate: float = 0.0005
-    early_stopping_patience: int = 15
+    early_stopping_patience: int = 20
     weight_decay: float = 0.001
     add_temporal: bool = True
     seed: int = 42
     model_type: str = "LSTM"  # "EALSTM" or "LSTM"
-    num_layers: int = 3  # LSTM layers (only used when model_type="LSTM")
-    val_fraction: float = 0.15  # fraction of training data held out for validation (early stopping / LR scheduling)
+    num_layers: int = 1  # LSTM layers (only used when model_type="LSTM")
+    val_fraction: float = 0.15  # fraction of training data held out for validation (ignored if val_years is set)
+    val_years: Optional[Union[int, Sequence[int]]] = (2022)  # if set, use these years from each training station as validation; else use val_fraction
     year_range: Tuple[int, int] = (2017, 2024)  # restrict experiment data to this year range (inclusive)
 
     # Presto embeddings as static features (added to Alpha Earth when True)
@@ -78,7 +90,7 @@ class CVConfig:
             self.dynamic_cols = [
                 # Original features
                 'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1',
-                'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I', 'TA_1_1_1', 'RH_1_1_1',
+                'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I', 'TA_1_1_1', 'RH_1_1_1', 'LE_1_1_1', 'NETRAD_1_1_1',
                 # Sentinel-2 features
                 'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a'
                 # Note: irrigation is NOT in dynamic_cols - it will be added as static feature
@@ -88,7 +100,7 @@ class CVConfig:
             # When use_presto_static: daily Presto (emb_0..emb_127) merged in loader + Alpha Earth + precip
             if self.use_presto_static:
                 self.static_cols = [f'emb_{k}' for k in range(128)] + [f'A{i:02d}' for i in range(64)] + [
-                    'precip_jan_apr', 'precip_may_oct',
+                    'precip_jan_apr',
                 ]
             else:
                 self.static_cols = [f'A{i:02d}' for i in range(64)] + [
@@ -125,7 +137,7 @@ def run_single_fold(
         seq_length=config.seq_length,
         nan_threshold=config.nan_threshold,
         same_year_constraint=True,
-        month_range=(1, 12),  # May–October only
+        month_range=(4, 10),  # May–October only
         year_range=config.year_range,
     )
 
@@ -145,10 +157,12 @@ def run_single_fold(
         dynamic_cols=config.dynamic_cols,
         static_cols=config.static_cols,
         target_col=config.target_col,
-        add_temporal=config.add_temporal,
-        temporal_features=['doy_sin', 'doy_cos'],
+        # add_temporal=config.add_temporal,
+        # temporal_features=['doy_sin', 'doy_cos'],
         use_presto_static=config.use_presto_static,
         presto_embeddings_path=presto_path if config.use_presto_static else None,
+            # exclude_irrigation_static=True,
+
     )
     
     model_config = ModelConfig(
@@ -169,21 +183,37 @@ def run_single_fold(
     # Prepare data
     logger.info("Preparing data...")
     processor = DataProcessor(data_config, feature_config)
-    data = processor.prepare_data(data_config.train_files, data_config.test_files)
+    val_years_for_scaler = config.val_years if getattr(config, 'val_years', None) is not None else None
+    data = processor.prepare_data(
+        data_config.train_files,
+        data_config.test_files,
+        val_years=val_years_for_scaler,
+    )
     
     # Create datasets
     full_train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'])
     test_dataset = RZSMDataset(data['X_d_test'], data['X_s_test'], data['y_test'])
     
-    # Split training data into train/val to prevent data leakage.
-    # Early stopping, LR scheduling, and model selection use val_loader
-    # (a held-out portion of training stations), NOT the test station.
-    val_size = int(len(full_train_dataset) * config.val_fraction)
-    train_size = len(full_train_dataset) - val_size
-    train_subset, val_subset = random_split(
-        full_train_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(config.seed),
-    )
+    # Split training data into train/val: either by year (val_years) or random fraction (val_fraction)
+    dates_train = data['dates_train']
+    years = pd.to_datetime(dates_train).year
+    if getattr(config, 'val_years', None) is not None:
+        val_years_raw = config.val_years
+        val_years_seq = (val_years_raw,) if isinstance(val_years_raw, int) else val_years_raw
+        val_years_set = set(val_years_seq)
+        val_indices = [i for i, y in enumerate(years) if y in val_years_set]
+        train_indices = [i for i, y in enumerate(years) if y not in val_years_set]
+        train_subset = Subset(full_train_dataset, train_indices)
+        val_subset = Subset(full_train_dataset, val_indices)
+        train_size, val_size = len(train_indices), len(val_indices)
+        logger.info(f"Validation set: years {sorted(val_years_set)} from training stations ({val_size} samples)")
+    else:
+        val_size = int(len(full_train_dataset) * config.val_fraction)
+        train_size = len(full_train_dataset) - val_size
+        train_subset, val_subset = random_split(
+            full_train_dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(config.seed),
+        )
     
     train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True)
     val_loader = DataLoader(val_subset, batch_size=config.batch_size, shuffle=False)
@@ -215,8 +245,23 @@ def run_single_fold(
     y_pred, y_true = evaluator.predict(test_loader)
     metrics = evaluator.compute_metrics(y_pred, y_true)
     
+    # Plot train/val loss curves for this fold
+    evaluator.plot_training_history(history, 'loss')
+    
+    # R² for growing season (May–October) for this test station
+    dates_test = data.get('dates_test')
+    r2_may_oct = np.nan
+    n_may_oct = 0
+    if dates_test is not None and len(dates_test) == len(y_true):
+        months = pd.to_datetime(dates_test).month
+        mask = (months >= 5) & (months <= 10)
+        n_may_oct = int(np.sum(mask))
+        if n_may_oct > 1:
+            r2_may_oct = _r2(y_true[mask], y_pred[mask])
+    
     logger.info(f"\nFold {fold_name} Results:")
     logger.info(f"  R²:   {metrics['r2']:.4f}")
+    logger.info(f"  R² (May–Oct): {r2_may_oct:.4f}" if not np.isnan(r2_may_oct) else "  R² (May–Oct): n/a")
     logger.info(f"  RMSE: {metrics['rmse']:.4f}")
     logger.info(f"  MAE:  {metrics['mae']:.4f}")
     
@@ -228,7 +273,12 @@ def run_single_fold(
         'y_true': y_true,
         'metrics': metrics,
         'history': history,
-        'dates_test': data.get('dates_test'),
+        'dates_test': dates_test,
+        'n_train': train_size,
+        'n_val': val_size,
+        'n_test': len(test_dataset),
+        'r2_may_oct': r2_may_oct,
+        'n_may_oct': n_may_oct,
     }
 
 
@@ -384,31 +434,54 @@ def main():
     log.info("CROSS-VALIDATION SUMMARY")
     log.info("="*70)
     
-    print("\n" + "="*70)
+    print("\n" + "="*100)
     print("CROSS-VALIDATION RESULTS")
-    print("="*70)
-    print(f"{'Test Station':<15} {'Train Stations':<20} {'R²':>10} {'RMSE':>10} {'MAE':>10}")
-    print("-"*70)
+    print("="*100)
+    print(f"{'Test Station':<15} {'Train Stations':<20} {'R²':>8} {'R²_MayOct':>10} {'RMSE':>8} {'MAE':>8} {'N_train':>10} {'N_val':>10} {'N_test':>10}")
+    print("-"*100)
     
     r2_scores = []
+    r2_may_oct_scores = []
     rmse_scores = []
     
     for result in results:
         test = result['test_station']
         train = '+'.join(result['train_stations'])
         r2 = result['metrics']['r2']
+        r2_mo = result.get('r2_may_oct', np.nan)
         rmse = result['metrics']['rmse']
         mae = result['metrics']['mae']
+        n_train = result.get('n_train', '')
+        n_val = result.get('n_val', '')
+        n_test = result.get('n_test', '')
         
         r2_scores.append(r2)
+        if not np.isnan(r2_mo):
+            r2_may_oct_scores.append(r2_mo)
         rmse_scores.append(rmse)
         
-        print(f"{test:<15} {train:<20} {r2:>10.4f} {rmse:>10.4f} {mae:>10.4f}")
+        r2_mo_str = f"{r2_mo:.4f}" if not np.isnan(r2_mo) else "n/a"
+        print(f"{test:<15} {train:<20} {r2:>8.4f} {r2_mo_str:>10} {rmse:>8.4f} {mae:>8.4f} {n_train:>10} {n_val:>10} {n_test:>10}")
     
-    print("-"*70)
-    print(f"{'MEAN':<15} {'':<20} {np.mean(r2_scores):>10.4f} {np.mean(rmse_scores):>10.4f}")
-    print(f"{'STD':<15} {'':<20} {np.std(r2_scores):>10.4f} {np.std(rmse_scores):>10.4f}")
-    print("="*70)
+    # Overall R² for growing season (May–Oct) pooled across all folds
+    all_y_true = np.concatenate([r['y_true'] for r in results])
+    all_y_pred = np.concatenate([r['y_pred'] for r in results])
+    all_dates = np.concatenate([r['dates_test'] for r in results])
+    months = pd.to_datetime(all_dates).month
+    mask_mo = (months >= 5) & (months <= 10)
+    r2_overall_may_oct = np.nan
+    if np.sum(mask_mo) > 1:
+        r2_overall_may_oct = _r2(all_y_true[mask_mo], all_y_pred[mask_mo])
+    
+    print("-"*100)
+    mean_r2_mo = np.mean(r2_may_oct_scores) if r2_may_oct_scores else np.nan
+    mean_r2_mo_str = f"{mean_r2_mo:.4f}" if not np.isnan(mean_r2_mo) else "n/a"
+    print(f"{'MEAN':<15} {'':<20} {np.mean(r2_scores):>8.4f} {mean_r2_mo_str:>10} {np.mean(rmse_scores):>8.4f} {'':>8} {'':>10} {'':>10} {'':>10}")
+    print(f"{'STD':<15} {'':<20} {np.std(r2_scores):>8.4f} {'':>10} {np.std(rmse_scores):>8.4f}")
+    print("-"*100)
+    r2_overall_mo_str = f"{r2_overall_may_oct:.4f}" if not np.isnan(r2_overall_may_oct) else "n/a"
+    print(f"Overall R² (May–Oct, pooled): {r2_overall_mo_str}")
+    print("="*100)
     
     # Save results to CSV
     results_df = pd.DataFrame([
@@ -416,17 +489,43 @@ def main():
             'test_station': r['test_station'],
             'train_stations': '+'.join(r['train_stations']),
             'r2': r['metrics']['r2'],
+            'r2_may_oct': r.get('r2_may_oct'),
             'rmse': r['metrics']['rmse'],
             'mae': r['metrics']['mae'],
             'bias': r['metrics']['bias'],
             'correlation': r['metrics']['correlation'],
-            'n_samples': r['metrics']['n_samples']
+            'n_samples': r['metrics']['n_samples'],
+            'n_may_oct': r.get('n_may_oct'),
+            'n_train': r.get('n_train'),
+            'n_val': r.get('n_val'),
+            'n_test': r.get('n_test'),
         }
         for r in results
     ])
     
     results_df.to_csv(output_dir / 'cv_results.csv', index=False)
     log.info(f"\nResults saved to: {output_dir / 'cv_results.csv'}")
+    
+    # Append overall May-Oct R² as a summary row to CSV
+    if not np.isnan(r2_overall_may_oct):
+        log.info(f"Overall R² (May–Oct, pooled): {r2_overall_may_oct:.4f}")
+        summary_row = pd.DataFrame([{
+            'test_station': 'OVERALL_MayOct',
+            'train_stations': '',
+            'r2': np.nan,
+            'r2_may_oct': r2_overall_may_oct,
+            'rmse': np.nan,
+            'mae': np.nan,
+            'bias': np.nan,
+            'correlation': np.nan,
+            'n_samples': int(np.sum(mask_mo)),
+            'n_may_oct': int(np.sum(mask_mo)),
+            'n_train': np.nan,
+            'n_val': np.nan,
+            'n_test': np.nan,
+        }])
+        results_df = pd.concat([results_df, summary_row], ignore_index=True)
+        results_df.to_csv(output_dir / 'cv_results.csv', index=False)
     
     log.info(f"\nOutputs saved to: {output_dir}")
     log.info("CV complete!")
