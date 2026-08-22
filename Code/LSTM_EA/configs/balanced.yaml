@@ -1,0 +1,52 @@
+# Balanced config - less regularization to help Ne1
+# Keeps hidden_dim=128 but reduces dropout to prevent underfitting
+
+experiment:
+  name: "balanced_ealstm"
+  output_dir: "outputs/balanced"
+
+data:
+  data_dir: "/Users/rouhinmitra/SM_work/Code/LSTM_EA/data"
+  train_files:
+    - "ne1_1_maize.csv"
+    - "ne2_1_maize.csv"
+  test_files:
+    - "ne3_1_maize.csv"
+  seq_length: 30
+  nan_threshold: 0.1
+  date_column: "Date"
+  target_column: "SWC_avg"
+
+features:
+  dynamic_features:
+    - "TA_avg"
+    - "P_sum"
+    - "RH_avg"
+    - "WS_avg"
+    - "PPFD_avg"
+    - "SWC_avg"
+    - "VPD_avg"
+    - "TS_avg"
+    - "doy_sin"
+    - "doy_cos"
+  static_features: null  # Will be auto-detected
+  add_temporal: true
+  temporal_features:
+    - "doy_sin"
+    - "doy_cos"
+
+model:
+  model_type: "ealstm"
+  hidden_dim: 128        # Keep larger capacity
+  dropout: 0.3           # REDUCED from 0.6 - less regularization!
+  num_layers: 1
+
+training:
+  epochs: 150
+  batch_size: 32
+  learning_rate: 0.0005  # Slightly higher LR for faster learning
+  early_stopping_patience: 25  # More patience
+  weight_decay: 0.0001   # REDUCED from 0.001 - less L2 regularization
+  val_split: 0.2
+
+

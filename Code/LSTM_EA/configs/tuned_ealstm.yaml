@@ -1,0 +1,55 @@
+# Tuned EA-LSTM Configuration
+# Addresses early stopping / overfitting issues
+
+name: "tuned_ealstm"
+
+data:
+  train_files:
+    - "ne1_1_maize.csv"
+    - "ne2_1_maize.csv"
+  test_files:
+    - "ne3_1_maize.csv"
+  data_dir: "/Users/rouhinmitra/SM_work/Data/Base/"
+  seq_length: 30
+  nan_threshold: 0.1
+  same_year_constraint: true
+
+features:
+  dynamic_cols:
+    - "SSM"
+    - "SSM_avg"
+    - "SWC_PI_F_2_1_1"
+    - "SWC_PI_F_3_1_1"
+    - "P_PI_F_1_1_1"
+    - "P_PI_F_2_2_1"
+    - "I"
+    - "TA_1_1_1"
+    - "RH_1_1_1"
+  static_cols: "A00-A63"
+  target_col: "RZSM_25_avg"
+  add_temporal: true  # Enable temporal features
+  temporal_features:
+    - "doy_sin"
+    - "doy_cos"
+
+model:
+  model_type: "EALSTM"
+  hidden_dim: 64        # Increased from 32
+  dropout: 0.5          # Increased from 0.4
+  num_layers: 1
+
+training:
+  batch_size: 32        # Smaller batches for better generalization
+  epochs: 100           # More epochs
+  learning_rate: 0.0005 # Lower LR for more stable training
+  weight_decay: 0.01    # Stronger regularization
+  early_stopping_patience: 15  # More patience
+  gradient_clip: 1.0
+  scheduler_patience: 7
+  scheduler_factor: 0.5
+
+seed: 42
+output_dir: "outputs"
+log_level: "INFO"
+
+

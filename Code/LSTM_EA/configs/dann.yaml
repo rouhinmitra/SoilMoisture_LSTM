@@ -1,0 +1,75 @@
+# DANN Domain Adaptation Configuration for EA-LSTM
+# Uses domain adversarial training for station-robust prediction
+
+name: "dann_ealstm"
+
+data:
+  data_dir: "/Users/rouhinmitra/SM_work/Data/Base/"
+  seq_length: 30
+  nan_threshold: 0.1  # 10% NaN threshold per column per window
+  same_year_constraint: true
+
+features:
+  # Dynamic features
+  dynamic_cols:
+    - "SSM"
+    - "SSM_avg"
+    - "SWC_PI_F_2_1_1"
+    - "SWC_PI_F_3_1_1"
+    - "P_PI_F_1_1_1"
+    - "P_PI_F_2_2_1"
+    - "I"
+    - "TA_1_1_1"
+    - "RH_1_1_1"
+    # Sentinel-2 features
+    - "ndvi"
+    - "b11"
+    - "b12"
+    - "b2"
+    - "b3"
+    - "b4"
+    - "b5"
+    - "b6"
+    - "b7"
+    - "b8"
+    - "b8a"
+  # Static features (Alpha Earth A00-A63)
+  static_cols: "A00-A63"  # Expands to 64 features
+  target_col: "RZSM_25_avg"
+  add_temporal: true
+  temporal_features:
+    - "doy_sin"
+    - "doy_cos"
+
+model:
+  model_type: "EALSTM_DANN"
+  hidden_dim: 128
+  dropout: 0.5
+  num_layers: 1
+
+# Domain Adaptation specific settings
+domain_adaptation:
+  # Domain discriminator architecture
+  domain_hidden_dim: 64
+  domain_dropout: 0.3
+  # Lambda (GRL) scheduling
+  lambda_max: 1.0
+  lambda_schedule: "gradual"  # Options: 'gradual', 'linear', 'constant'
+  # Domain loss weight in combined loss
+  domain_loss_weight: 0.5
+
+training:
+  batch_size: 32
+  epochs: 150
+  learning_rate: 0.0005
+  weight_decay: 0.001
+  early_stopping_patience: 20  # Longer patience for DA training
+  gradient_clip: 1.0
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+seed: 42
+output_dir: "outputs"
+log_level: "INFO"
+
+

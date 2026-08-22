@@ -1,36 +1,102 @@
 #!/usr/bin/env python
 """
-Leave-One-Station-Out Cross-Validation for EA-LSTM.
+Leave-One-Station-Out Cross-Validation for EA-LSTM/LSTM — 50cm RZSM.
 
 Trains on 2 stations, tests on the 3rd, for all 3 combinations:
 - Fold 1: Train Ne1+Ne2, Test Ne3
-- Fold 2: Train Ne1+Ne3, Test Ne2  
+- Fold 2: Train Ne1+Ne3, Test Ne2
 - Fold 3: Train Ne2+Ne3, Test Ne1
 
+Target: RZSM_50_avg (50cm root zone soil moisture).
 Generates individual and combined scatter plots with R² scores.
 """
-import torch
+import logging
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
-from torch.utils.data import DataLoader, random_split, Subset
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Union, Sequence
-import logging
+import torch
+from torch.utils.data import DataLoader, Subset, random_split
 
 from src.config import DataConfig, FeatureConfig, ModelConfig, TrainingConfig
 from src.data_loader import DataProcessor, RZSMDataset
+from src.evaluator import Evaluator
 from src.models import get_model
 from src.trainer import Trainer
-from src.evaluator import Evaluator
 from utils.logging_utils import setup_logging
+
+# --- Plotting utilities ---
+def _plot_yearly_timeseries(
+    *,
+    fold_output_dir: Path,
+    test_csv_path: Path,
+    dates_test: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    target_label: str,
+):
+    """
+    Plot one time series per year for the held-out station with:
+    - SSM_avg (from the test CSV)
+    - RZSM_obs (y_true)
+    - RZSM_pred (y_pred)
+    """
+    if dates_test is None or len(dates_test) != len(y_true):
+        return
+
+    df_pred = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(dates_test),
+            "RZSM_obs": y_true,
+            "RZSM_pred": y_pred,
+        }
+    )
+
+    df_test = pd.read_csv(test_csv_path)
+    if "Date" not in df_test.columns or "SSM_avg" not in df_test.columns:
+        raise ValueError(f"Test file {test_csv_path} must contain Date and SSM_avg columns")
+    df_test = df_test.copy()
+    df_test["Date"] = pd.to_datetime(df_test["Date"], errors="coerce")
+    df_test = df_test.dropna(subset=["Date"])
+    df_test = df_test.sort_values("Date").drop_duplicates(subset="Date", keep="first")
+
+    df = df_pred.merge(df_test[["Date", "SSM_avg"]], on="Date", how="inner").sort_values("Date")
+    if df.empty:
+        return
+
+    out_dir = fold_output_dir / "yearly_timeseries"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df["Year"] = df["Date"].dt.year
+    for year, g in df.groupby("Year"):
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.plot(g["Date"], g["SSM_avg"], label="SSM_avg", linewidth=1.5, alpha=0.9)
+        ax.plot(g["Date"], g["RZSM_obs"], label=f"{target_label} obs", linewidth=1.8, alpha=0.9)
+        ax.plot(g["Date"], g["RZSM_pred"], label=f"{target_label} pred", linewidth=1.8, alpha=0.9, linestyle="--")
+        ax.set_title(f"{target_label} vs SSM_avg — {year}", fontsize=12)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Soil moisture")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"timeseries_{int(year)}.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
 # Configuration
 STATIONS = {
     'Ne1': 'ne1_1_maize.csv',
-    'Ne2': 'ne2_1_maize.csv', 
+    'Ne2': 'ne2_1_maize.csv',
     'Ne3': 'ne3_1_maize.csv'
+}
+
+PREDICTION_PATHS = {
+    'Ne1': '/Users/rouhinmitra/SM_work/Code/LSTM_EA/outputs/sensitivity/seq20/baseline/predictions_Ne1.csv',
+    'Ne2': '/Users/rouhinmitra/SM_work/Code/LSTM_EA/outputs/sensitivity/seq20/baseline/predictions_Ne2.csv',
+    'Ne3': '/Users/rouhinmitra/SM_work/Code/LSTM_EA/outputs/sensitivity/seq20/baseline/predictions_Ne3.csv',
 }
 
 CV_FOLDS = [
@@ -39,74 +105,129 @@ CV_FOLDS = [
     {'train': ['Ne2', 'Ne3'], 'test': 'Ne1', 'name': 'fold3_test_Ne1'},
 ]
 
-
-def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """R² (1 - SS_res/SS_tot). Returns np.nan if SS_tot is 0 or len < 2."""
-    if len(y_true) < 2:
-        return np.nan
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    if ss_tot == 0:
-        return np.nan
-    return float(1 - (ss_res / ss_tot))
+TARGET_COL = "RZSM_50_avg"  # 50cm root zone soil moisture
 
 
 @dataclass
 class CVConfig:
-    """Cross-validation configuration - TUNED (BEST: Mean R² = 0.67)"""
+    """Cross-validation configuration — mirrors run_cv.py, but 50cm target."""
     data_dir: str = "/Users/rouhinmitra/SM_work/Data/Base/"
-    output_dir: str = "outputs/cv_results_tuned"
-    seq_length: int = 20
+    output_dir: str = "outputs/cv_results_tuned_50cm"
+    seq_length: int = 30
     nan_threshold: float = 0.1
-    # TUNED hyperparameters - best overall performance
+    # Tuned hyperparameters (kept consistent with 25cm script defaults)
     hidden_dim: int = 32
-    dropout: float = 0.50
-    batch_size: int = 16
+    dropout: float = 0.5
+    batch_size: int = 32
     epochs: int = 150
-    learning_rate: float = 0.001357325450199082
+    learning_rate: float = 0.0005
     early_stopping_patience: int = 20
-    weight_decay: float = 5.524892417048377e-05
+    weight_decay: float = 0.001
     add_temporal: bool = True
     seed: int = 42
     model_type: str = "LSTM"  # "EALSTM" or "LSTM"
-    num_layers: int = 2 # LSTM layers (only used when model_type="LSTM")
-    val_fraction: float = 0.15  # fraction of training data held out for validation (ignored if val_years is set)
-    val_years: Optional[Union[int, Sequence[int]]] = (2022)  # if set, use these years from each training station as validation; else use val_fraction
-    year_range: Tuple[int, int] = (2017, 2024)  # restrict experiment data to this year range (inclusive)
+    num_layers: int = 1  # only used when model_type="LSTM"
+    val_fraction: float = 0.15  # fraction of training data held out for validation (used when val_years is None)
+    val_years: Optional[Union[int, Sequence[int]]] = 2022  # if set, use these years from each training station as validation
+    year_range: Tuple[int, int] = (2017, 2024)
+    month_range: Tuple[int, int] = (4, 10)
 
     # Presto embeddings as static features (added to Alpha Earth when True)
     use_presto_static: bool = True
     presto_embeddings_path: str = "/Users/rouhinmitra/SM_work/Code/Data/s2_pixels/presto_embeddings_fused_interpolated.csv"
-    
+
+    # Optional auxiliary predictions (25cm) merged into base CSV on Date
+    use_aux_predictions: bool = False
+
     # Features
     dynamic_cols: List[str] = None
     static_cols: List[str] = None
-    target_col: str = "RZSM_25_avg"
-    
+    target_col: str = TARGET_COL
+
     def __post_init__(self):
-        if self.model_type == "LSTM" and self.output_dir == "outputs/cv_results_tuned":
-            self.output_dir = "outputs/cv_results_lstm"
+        if self.model_type == "LSTM" and self.output_dir == "outputs/cv_results_tuned_50cm":
+            self.output_dir = "outputs/cv_results_lstm_50cm"
         if self.dynamic_cols is None:
             self.dynamic_cols = [
                 # Original features
-                'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1',
-                'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I', 'TA_1_1_1', 'RH_1_1_1', 'LE_1_1_1', 'NETRAD_1_1_1',
+                'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1', 
+                'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I', 'TA_1_1_1', 'RH_1_1_1',
                 # Sentinel-2 features
-                'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a'
-                # Note: irrigation is NOT in dynamic_cols - it will be added as static feature
-                # to control the input gate (similar to Alpha Earth embeddings)
+                'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a',
+                # LSTM-predicted 25cm RZSM (dynamic feature)
+                # 'RZSM25_pred',
+                "RZSM_25_avg",
+                # Note: irrigation is NOT in dynamic_cols (it will be appended as static feature)
             ]
         if self.static_cols is None:
-            # When use_presto_static: daily Presto (emb_0..emb_127) merged in loader + Alpha Earth + precip
             if self.use_presto_static:
                 self.static_cols = [f'emb_{k}' for k in range(128)] + [f'A{i:02d}' for i in range(64)] + [
                     'precip_jan_apr',
                 ]
             else:
                 self.static_cols = [f'A{i:02d}' for i in range(64)] + [
-                    'precip_jan_apr',   # accumulated precip Jan 1–Apr 30 (static / input-gate)
-                    # 'precip_may_oct',   # accumulated precip May–Oct summer (static / input-gate)
+                    'precip_jan_apr',
+                    # 'precip_may_oct',
                 ]
+
+
+def _load_predictions_for_station(station: str) -> pd.DataFrame:
+    """Load LSTM-predicted 25cm RZSM for a given station."""
+    if station not in PREDICTION_PATHS:
+        raise ValueError(f"No prediction path configured for station {station}")
+    pred_path = Path(PREDICTION_PATHS[station])
+    if not pred_path.exists():
+        raise FileNotFoundError(f"Predictions file not found for {station}: {pred_path}")
+    df = pd.read_csv(pred_path)
+    if 'Date' not in df.columns or 'RZSM_pred' not in df.columns:
+        raise ValueError(f"Predictions file {pred_path} must contain 'Date' and 'RZSM_pred' columns")
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df[['Date', 'RZSM_pred']].rename(columns={'RZSM_pred': 'RZSM25_pred'})
+    return df
+
+
+def _create_merged_station_files(
+    config: CVConfig,
+    train_stations: List[str],
+    test_station: str,
+    fold_output_dir: Path,
+) -> Dict[str, Union[str, List[str]]]:
+    """
+    For each station, merge base CSV with LSTM 25cm predictions on Date and
+    write merged CSVs into a temporary directory. Returns updated data_dir and
+    train/test file lists suitable for DataConfig.
+    """
+    merged_dir = fold_output_dir / "merged_with_predictions"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    def _merge_single_station(station: str) -> str:
+        base_filename = STATIONS[station]
+        base_path = Path(config.data_dir) / base_filename
+        if not base_path.exists():
+            raise FileNotFoundError(f"Base data file not found for station {station}: {base_path}")
+        base_df = pd.read_csv(base_path)
+        if 'Date' not in base_df.columns:
+            raise ValueError(f"Base data file {base_path} must contain a 'Date' column")
+        base_df = base_df.copy()
+        base_df['Date'] = pd.to_datetime(base_df['Date'])
+
+        pred_df = _load_predictions_for_station(station)
+        merged = base_df.merge(pred_df, on='Date', how='inner')
+
+        out_name = base_filename.replace('.csv', '_with_pred.csv')
+        out_path = merged_dir / out_name
+        merged.to_csv(out_path, index=False)
+        return out_name
+
+    train_files_merged = [_merge_single_station(s) for s in train_stations]
+    test_file_merged = _merge_single_station(test_station)
+
+    return {
+        'data_dir': str(merged_dir),
+        'train_files': train_files_merged,
+        'test_files': [test_file_merged],
+    }
 
 
 def run_single_fold(
@@ -116,28 +237,42 @@ def run_single_fold(
 ) -> Dict:
     """
     Run a single CV fold.
-    
+
     Returns dict with predictions, actuals, metrics, and station info.
     """
     fold_name = fold['name']
     train_stations = fold['train']
     test_station = fold['test']
-    
+
     logger.info(f"\n{'='*70}")
     logger.info(f"FOLD: {fold_name}")
     logger.info(f"Training on: {train_stations}")
     logger.info(f"Testing on: {test_station}")
     logger.info(f"{'='*70}")
-    
-    # Create configs
+
+    fold_output_dir = Path(config.output_dir) / fold_name
+    fold_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if config.use_aux_predictions:
+        logger.info("Aux predictions: ENABLED (merging 25cm predictions into base CSVs on Date)")
+        merged_info = _create_merged_station_files(config, train_stations, test_station, fold_output_dir)
+        train_files = merged_info["train_files"]
+        test_files = merged_info["test_files"]
+        data_dir = merged_info["data_dir"]
+    else:
+        logger.info("Aux predictions: disabled (using base station CSVs only)")
+        train_files = [STATIONS[s] for s in train_stations]
+        test_files = [STATIONS[test_station]]
+        data_dir = config.data_dir
+
     data_config = DataConfig(
-        train_files=[STATIONS[s] for s in train_stations],
-        test_files=[STATIONS[test_station]],
-        data_dir=config.data_dir,
+        train_files=train_files,
+        test_files=test_files,
+        data_dir=data_dir,
         seq_length=config.seq_length,
         nan_threshold=config.nan_threshold,
         same_year_constraint=True,
-        month_range=(4, 10),  # May–October only
+        month_range=config.month_range,
         year_range=config.year_range,
     )
 
@@ -152,26 +287,24 @@ def run_single_fold(
                 f"Presto embeddings file not found: {presto_path}. "
                 "Set use_presto_static=False or provide a valid presto_embeddings_path."
             )
-    
+
     feature_config = FeatureConfig(
         dynamic_cols=config.dynamic_cols,
         static_cols=config.static_cols,
         target_col=config.target_col,
-        # add_temporal=config.add_temporal,
-        # temporal_features=['doy_sin', 'doy_cos'],
+        add_temporal=config.add_temporal,
+        temporal_features=['doy_sin', 'doy_cos'],
         use_presto_static=config.use_presto_static,
         presto_embeddings_path=presto_path if config.use_presto_static else None,
-            # exclude_irrigation_static=True,
-
     )
-    
+
     model_config = ModelConfig(
         model_type=config.model_type,
         hidden_dim=config.hidden_dim,
         dropout=config.dropout,
-        num_layers=config.num_layers
+        num_layers=config.num_layers,
     )
-    
+
     training_config = TrainingConfig(
         batch_size=config.batch_size,
         epochs=config.epochs,
@@ -179,7 +312,7 @@ def run_single_fold(
         early_stopping_patience=config.early_stopping_patience,
         weight_decay=config.weight_decay
     )
-    
+
     # Prepare data
     logger.info("Preparing data...")
     processor = DataProcessor(data_config, feature_config)
@@ -189,11 +322,11 @@ def run_single_fold(
         data_config.test_files,
         val_years=val_years_for_scaler,
     )
-    
+
     # Create datasets
     full_train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'])
     test_dataset = RZSMDataset(data['X_d_test'], data['X_s_test'], data['y_test'])
-    
+
     # Split training data into train/val: either by year (val_years) or random fraction (val_fraction)
     dates_train = data['dates_train']
     years = pd.to_datetime(dates_train).year
@@ -211,60 +344,80 @@ def run_single_fold(
         val_size = int(len(full_train_dataset) * config.val_fraction)
         train_size = len(full_train_dataset) - val_size
         train_subset, val_subset = random_split(
-            full_train_dataset, [train_size, val_size],
+            full_train_dataset,
+            [train_size, val_size],
             generator=torch.Generator().manual_seed(config.seed),
         )
-    
+
     train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True)
     val_loader = DataLoader(val_subset, batch_size=config.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
-    
+
     logger.info(f"Train/Val/Test split: {train_size} / {val_size} / {len(test_dataset)} samples")
-    
+
     # Get dimensions
     dyn_dim = data['X_d_train'].shape[2]
     stat_dim = data['X_s_train'].shape[2]
-    
+
     # Create model
     logger.info("Creating model...")
     model = get_model(model_config, dyn_dim, stat_dim)
-    
-    # Train
-    fold_output_dir = Path(config.output_dir) / fold_name
-    fold_output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     trainer = Trainer(model, training_config, str(fold_output_dir), device=str(device))
-    
+
     logger.info("Training (val_loader from training stations, test station held out)...")
     history = trainer.train(train_loader, val_loader)
-    
+
     # Evaluate
     logger.info("Evaluating...")
     evaluator = Evaluator(trainer.model, processor.scaler_y, str(fold_output_dir), device=str(device))
     y_pred, y_true = evaluator.predict(test_loader)
     metrics = evaluator.compute_metrics(y_pred, y_true)
-    
-    # Plot train/val loss curves for this fold
-    evaluator.plot_training_history(history, 'loss')
-    
-    # R² for growing season (May–October) for this test station
-    dates_test = data.get('dates_test')
-    r2_may_oct = np.nan
-    n_may_oct = 0
-    if dates_test is not None and len(dates_test) == len(y_true):
-        months = pd.to_datetime(dates_test).month
-        mask = (months >= 5) & (months <= 10)
-        n_may_oct = int(np.sum(mask))
-        if n_may_oct > 1:
-            r2_may_oct = _r2(y_true[mask], y_pred[mask])
-    
+
+    # Plot train/val loss curves for this fold (same as run_cv.py)
+    evaluator.plot_training_history(history, "loss")
+
     logger.info(f"\nFold {fold_name} Results:")
     logger.info(f"  R²:   {metrics['r2']:.4f}")
-    logger.info(f"  R² (May–Oct): {r2_may_oct:.4f}" if not np.isnan(r2_may_oct) else "  R² (May–Oct): n/a")
     logger.info(f"  RMSE: {metrics['rmse']:.4f}")
     logger.info(f"  MAE:  {metrics['mae']:.4f}")
-    
+
+    # Save per-fold predictions for the held-out (test) station
+    dates_test = data.get('dates_test')
+    if dates_test is not None and len(dates_test) == len(y_true):
+        pred_df = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(dates_test),
+                "RZSM_obs": y_true,
+                "RZSM_50_pred": y_pred,
+                # Convenience column for downstream scripts expecting `RZSM_pred`
+                "RZSM_pred": y_pred,
+            }
+        ).sort_values("Date")
+        pred_out_path = Path(config.output_dir) / f"predictions_{test_station}.csv"
+        pred_df.to_csv(pred_out_path, index=False)
+        logger.info(f"Saved predictions for {test_station} to: {pred_out_path}")
+    else:
+        logger.warning(
+            "Could not save predictions CSV (dates_test missing or length mismatch). "
+            f"dates_test_len={None if dates_test is None else len(dates_test)}, y_len={len(y_true)}"
+        )
+
+    # Plot per-year time series for test station: SSM_avg, obs, pred
+    try:
+        test_csv_path = Path(data_config.data_dir) / data_config.test_files[0]
+        _plot_yearly_timeseries(
+            fold_output_dir=fold_output_dir,
+            test_csv_path=test_csv_path,
+            dates_test=dates_test,
+            y_true=y_true,
+            y_pred=y_pred,
+            target_label="RZSM_50",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create yearly time series plots for {test_station}: {e}")
+
     return {
         'fold_name': fold_name,
         'test_station': test_station,
@@ -274,120 +427,113 @@ def run_single_fold(
         'metrics': metrics,
         'history': history,
         'dates_test': dates_test,
-        'n_train': train_size,
-        'n_val': val_size,
-        'n_test': len(test_dataset),
-        'r2_may_oct': r2_may_oct,
-        'n_may_oct': n_may_oct,
     }
 
 
 def create_combined_scatter_plot(results: List[Dict], output_dir: Path, model_type: str = "EALSTM"):
     """Create a combined scatter plot with all folds."""
-    
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
+
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
-    
+
     for i, (result, ax, color) in enumerate(zip(results, axes, colors)):
         y_pred = result['y_pred']
         y_true = result['y_true']
         metrics = result['metrics']
         test_station = result['test_station']
-        
-        # Scatter plot
+
         ax.scatter(y_true, y_pred, alpha=0.3, s=10, c=color)
-        
-        # 1:1 line
+
         min_val = min(y_true.min(), y_pred.min())
         max_val = max(y_true.max(), y_pred.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='1:1 Line')
-        
-        # Best fit line
+
         z = np.polyfit(y_true, y_pred, 1)
         p = np.poly1d(z)
         x_line = np.linspace(min_val, max_val, 100)
         ax.plot(x_line, p(x_line), 'k-', linewidth=1.5, alpha=0.7, label='Best Fit')
-        
+
         ax.set_xlabel('Observed RZSM (%)', fontsize=11)
         ax.set_ylabel('Predicted RZSM (%)', fontsize=11)
         ax.set_title(f'Test: {test_station}\nR² = {metrics["r2"]:.3f}, RMSE = {metrics["rmse"]:.2f}', fontsize=12)
         ax.set_aspect('equal', 'box')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper left', fontsize=9)
-    
-    plt.suptitle(f'Leave-One-Station-Out Cross-Validation: {model_type}', fontsize=14, fontweight='bold')
+
+    plt.suptitle('Leave-One-Station-Out Cross-Validation: EA-LSTM (50cm RZSM)', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    
+
     save_path = output_dir / 'cv_scatter_plots.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"Combined scatter plot saved to: {save_path}")
 
 
 def create_summary_plot(results: List[Dict], output_dir: Path):
     """Create a summary bar plot of R² scores."""
-    
     fig, ax = plt.subplots(figsize=(8, 5))
-    
+
     stations = [r['test_station'] for r in results]
     r2_scores = [r['metrics']['r2'] for r in results]
-    rmse_scores = [r['metrics']['rmse'] for r in results]
-    
+
     x = np.arange(len(stations))
     width = 0.35
-    
+
     bars1 = ax.bar(x - width/2, r2_scores, width, label='R²', color='steelblue')
-    
-    # Add value labels on bars
+
     for bar, val in zip(bars1, r2_scores):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
                f'{val:.3f}', ha='center', va='bottom', fontsize=10)
-    
-    # Add mean line
+
     mean_r2 = np.mean(r2_scores)
     ax.axhline(y=mean_r2, color='red', linestyle='--', linewidth=2, label=f'Mean R² = {mean_r2:.3f}')
-    
+
     ax.set_ylabel('R² Score', fontsize=12)
     ax.set_xlabel('Test Station', fontsize=12)
-    ax.set_title('Leave-One-Station-Out CV: R² by Test Station', fontsize=14)
+    ax.set_title('Leave-One-Station-Out CV: R² by Test Station (50cm RZSM)', fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels([f'Test: {s}' for s in stations])
     ax.legend(loc='lower right')
     ax.set_ylim(0, 1.0)
     ax.grid(True, alpha=0.3, axis='y')
-    
+
     plt.tight_layout()
-    
+
     save_path = output_dir / 'cv_r2_summary.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"R² summary plot saved to: {save_path}")
 
 
 def main():
-    """Run leave-one-station-out cross-validation."""
-    
-    # Configuration
-    config = CVConfig()
-    
-    # Setup output directory and logging
+    """Run leave-one-station-out cross-validation for 50cm RZSM."""
+    parser = argparse.ArgumentParser(description="Leave-one-station-out CV for 50cm RZSM.")
+    parser.add_argument("--use-aux-predictions", action="store_true", help="Merge 25cm predictions into base CSVs on Date.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Override output_dir (default from CVConfig).")
+    args = parser.parse_args()
+
+    config = CVConfig(use_aux_predictions=bool(args.use_aux_predictions))
+    if args.output_dir:
+        config.output_dir = args.output_dir
+
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger = setup_logging(str(output_dir), log_level="INFO")
     log = logging.getLogger(__name__)
-    
+
     log.info("="*70)
-    log.info("LEAVE-ONE-STATION-OUT CROSS-VALIDATION")
+    log.info("LEAVE-ONE-STATION-OUT CROSS-VALIDATION — 50cm RZSM")
     log.info("="*70)
+    log.info(f"Target: {TARGET_COL}")
     log.info(f"Model: {config.model_type}")
+    log.info(f"Year range: {config.year_range[0]}–{config.year_range[1]} (inclusive)")
     log.info(f"Stations: {list(STATIONS.keys())}")
     log.info(f"Number of folds: {len(CV_FOLDS)}")
-    log.info(f"Year range: {config.year_range[0]}–{config.year_range[1]} (inclusive)")
-    log.info("Data: May–November only (month_range=(5, 11))")
+    log.info(f"Data: month_range={config.month_range}")
+    log.info(f"Aux predictions: {'ENABLED' if config.use_aux_predictions else 'disabled'}")
     if config.use_presto_static:
         presto_path = Path(config.presto_embeddings_path)
         if not presto_path.is_absolute():
@@ -397,10 +543,7 @@ def main():
     else:
         log.info("Presto embeddings: disabled (static = Alpha Earth A00-A63 + precip only)")
     log.info("Irrigation feature: Used as STATIC feature (input gate control)")
-    log.info("  - Similar to Alpha Earth embeddings")
-    log.info("  - Extracted from first timestep of each sequence")
-    
-    # Fail fast if Presto enabled but file missing
+
     if config.use_presto_static:
         p = Path(config.presto_embeddings_path)
         if not p.is_absolute():
@@ -411,128 +554,73 @@ def main():
                 "Set use_presto_static=False or provide a valid presto_embeddings_path."
             )
 
-    # Set seeds
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    
-    # Run all folds
+
     results = []
     for fold in CV_FOLDS:
         result = run_single_fold(fold, config, log)
         results.append(result)
-    
-    # Create visualizations
+
     log.info("\n" + "="*70)
     log.info("CREATING VISUALIZATIONS")
     log.info("="*70)
-    
+
     create_combined_scatter_plot(results, output_dir, model_type=config.model_type)
     create_summary_plot(results, output_dir)
-    
-    # Print summary
+
     log.info("\n" + "="*70)
     log.info("CROSS-VALIDATION SUMMARY")
     log.info("="*70)
-    
-    print("\n" + "="*100)
-    print("CROSS-VALIDATION RESULTS")
-    print("="*100)
-    print(f"{'Test Station':<15} {'Train Stations':<20} {'R²':>8} {'R²_MayOct':>10} {'RMSE':>8} {'MAE':>8} {'N_train':>10} {'N_val':>10} {'N_test':>10}")
-    print("-"*100)
-    
+
+    print("\n" + "="*70)
+    print("CROSS-VALIDATION RESULTS (50cm RZSM)")
+    print("="*70)
+    print(f"{'Test Station':<15} {'Train Stations':<20} {'R²':>10} {'RMSE':>10} {'MAE':>10}")
+    print("-"*70)
+
     r2_scores = []
-    r2_may_oct_scores = []
     rmse_scores = []
-    
+
     for result in results:
         test = result['test_station']
         train = '+'.join(result['train_stations'])
         r2 = result['metrics']['r2']
-        r2_mo = result.get('r2_may_oct', np.nan)
         rmse = result['metrics']['rmse']
         mae = result['metrics']['mae']
-        n_train = result.get('n_train', '')
-        n_val = result.get('n_val', '')
-        n_test = result.get('n_test', '')
-        
+
         r2_scores.append(r2)
-        if not np.isnan(r2_mo):
-            r2_may_oct_scores.append(r2_mo)
         rmse_scores.append(rmse)
-        
-        r2_mo_str = f"{r2_mo:.4f}" if not np.isnan(r2_mo) else "n/a"
-        print(f"{test:<15} {train:<20} {r2:>8.4f} {r2_mo_str:>10} {rmse:>8.4f} {mae:>8.4f} {n_train:>10} {n_val:>10} {n_test:>10}")
-    
-    # Overall R² for growing season (May–Oct) pooled across all folds
-    all_y_true = np.concatenate([r['y_true'] for r in results])
-    all_y_pred = np.concatenate([r['y_pred'] for r in results])
-    all_dates = np.concatenate([r['dates_test'] for r in results])
-    months = pd.to_datetime(all_dates).month
-    mask_mo = (months >= 5) & (months <= 10)
-    r2_overall_may_oct = np.nan
-    if np.sum(mask_mo) > 1:
-        r2_overall_may_oct = _r2(all_y_true[mask_mo], all_y_pred[mask_mo])
-    
-    print("-"*100)
-    mean_r2_mo = np.mean(r2_may_oct_scores) if r2_may_oct_scores else np.nan
-    mean_r2_mo_str = f"{mean_r2_mo:.4f}" if not np.isnan(mean_r2_mo) else "n/a"
-    print(f"{'MEAN':<15} {'':<20} {np.mean(r2_scores):>8.4f} {mean_r2_mo_str:>10} {np.mean(rmse_scores):>8.4f} {'':>8} {'':>10} {'':>10} {'':>10}")
-    print(f"{'STD':<15} {'':<20} {np.std(r2_scores):>8.4f} {'':>10} {np.std(rmse_scores):>8.4f}")
-    print("-"*100)
-    r2_overall_mo_str = f"{r2_overall_may_oct:.4f}" if not np.isnan(r2_overall_may_oct) else "n/a"
-    print(f"Overall R² (May–Oct, pooled): {r2_overall_mo_str}")
-    print("="*100)
-    
-    # Save results to CSV
+
+        print(f"{test:<15} {train:<20} {r2:>10.4f} {rmse:>10.4f} {mae:>10.4f}")
+
+    print("-"*70)
+    print(f"{'MEAN':<15} {'':<20} {np.mean(r2_scores):>10.4f} {np.mean(rmse_scores):>10.4f}")
+    print(f"{'STD':<15} {'':<20} {np.std(r2_scores):>10.4f} {np.std(rmse_scores):>10.4f}")
+    print("="*70)
+
     results_df = pd.DataFrame([
         {
             'test_station': r['test_station'],
             'train_stations': '+'.join(r['train_stations']),
             'r2': r['metrics']['r2'],
-            'r2_may_oct': r.get('r2_may_oct'),
             'rmse': r['metrics']['rmse'],
             'mae': r['metrics']['mae'],
             'bias': r['metrics']['bias'],
             'correlation': r['metrics']['correlation'],
-            'n_samples': r['metrics']['n_samples'],
-            'n_may_oct': r.get('n_may_oct'),
-            'n_train': r.get('n_train'),
-            'n_val': r.get('n_val'),
-            'n_test': r.get('n_test'),
+            'n_samples': r['metrics']['n_samples']
         }
         for r in results
     ])
-    
+
     results_df.to_csv(output_dir / 'cv_results.csv', index=False)
     log.info(f"\nResults saved to: {output_dir / 'cv_results.csv'}")
-    
-    # Append overall May-Oct R² as a summary row to CSV
-    if not np.isnan(r2_overall_may_oct):
-        log.info(f"Overall R² (May–Oct, pooled): {r2_overall_may_oct:.4f}")
-        summary_row = pd.DataFrame([{
-            'test_station': 'OVERALL_MayOct',
-            'train_stations': '',
-            'r2': np.nan,
-            'r2_may_oct': r2_overall_may_oct,
-            'rmse': np.nan,
-            'mae': np.nan,
-            'bias': np.nan,
-            'correlation': np.nan,
-            'n_samples': int(np.sum(mask_mo)),
-            'n_may_oct': int(np.sum(mask_mo)),
-            'n_train': np.nan,
-            'n_val': np.nan,
-            'n_test': np.nan,
-        }])
-        results_df = pd.concat([results_df, summary_row], ignore_index=True)
-        results_df.to_csv(output_dir / 'cv_results.csv', index=False)
-    
+
     log.info(f"\nOutputs saved to: {output_dir}")
     log.info("CV complete!")
-    
+
     return results
 
 
 if __name__ == "__main__":
     results = main()
-
