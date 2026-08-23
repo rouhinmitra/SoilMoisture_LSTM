@@ -74,6 +74,15 @@ class CVConfig:
     val_years: Optional[Union[int, Sequence[int]]] = (2022)  # if set, use these years from each training station as validation; else use val_fraction
     year_range: Tuple[int, int] = (2017, 2024)  # restrict experiment data to this year range (inclusive)
 
+    # Drop the auto-appended irrigation static (default False = published behaviour)
+    exclude_irrigation_static: bool = False
+
+    # Correctness fixes; both default False = published behaviour (see src/config.py)
+    require_contiguous_windows: bool = False   # A4
+    impute_statics_after_scaling: bool = False # A3
+    forget_gate_bias_init: Optional[float] = None  # B4
+    swi_api_taus: Optional[Sequence[int]] = None   # D1
+
     # Presto embeddings as static features (added to Alpha Earth when True)
     use_presto_static: bool = True
     presto_embeddings_path: str = "/Users/rouhinmitra/SM_work/Code/Data/s2_pixels/presto_embeddings_fused_interpolated.csv"
@@ -139,6 +148,9 @@ def run_single_fold(
         same_year_constraint=True,
         month_range=(4, 10),  # May–October only
         year_range=config.year_range,
+        require_contiguous_windows=config.require_contiguous_windows,
+        impute_statics_after_scaling=config.impute_statics_after_scaling,
+        swi_api_taus=config.swi_api_taus,
     )
 
     # Resolve Presto embeddings path (relative to LSTM_EA project root)
@@ -153,23 +165,28 @@ def run_single_fold(
                 "Set use_presto_static=False or provide a valid presto_embeddings_path."
             )
     
+    _dyn_cols = list(config.dynamic_cols)
+    if config.swi_api_taus:
+        _dyn_cols += [f'swi_{t}' for t in config.swi_api_taus]
+        _dyn_cols += [f'api_{t}' for t in config.swi_api_taus]
+
     feature_config = FeatureConfig(
-        dynamic_cols=config.dynamic_cols,
+        dynamic_cols=_dyn_cols,
         static_cols=config.static_cols,
         target_col=config.target_col,
         # add_temporal=config.add_temporal,
         # temporal_features=['doy_sin', 'doy_cos'],
         use_presto_static=config.use_presto_static,
         presto_embeddings_path=presto_path if config.use_presto_static else None,
-            # exclude_irrigation_static=True,
-
+        exclude_irrigation_static=config.exclude_irrigation_static,
     )
     
     model_config = ModelConfig(
         model_type=config.model_type,
         hidden_dim=config.hidden_dim,
         dropout=config.dropout,
-        num_layers=config.num_layers
+        num_layers=config.num_layers,
+        forget_gate_bias_init=config.forget_gate_bias_init,
     )
     
     training_config = TrainingConfig(

@@ -3,7 +3,7 @@ Configuration management for EA-LSTM experiments.
 Uses dataclasses for typed configuration with validation.
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Sequence
 import yaml
 from pathlib import Path
 import logging
@@ -24,6 +24,17 @@ class DataConfig:
     month_range: Optional[Tuple[int, int]] = None
     # Optional (min_year, max_year) inclusive. None = use all years.
     year_range: Optional[Tuple[int, int]] = None
+    # A4: drop windows whose calendar span exceeds seq_length days.  Windows are
+    # sliced by ROW position, so a gap in the daily record silently produces a
+    # window spanning more days than seq_length.  Default False = published behaviour.
+    require_contiguous_windows: bool = False
+    # A3: impute missing statics AFTER scaling (fill with 0 in z-space = the
+    # training mean) instead of before (raw 0.0 -> an arbitrary z-score).
+    # Default False = published behaviour.
+    impute_statics_after_scaling: bool = False
+    # D1: add SWI (exponential-filter soil water index) and API (antecedent precipitation
+    # index) channels at these characteristic timescales, in days.  None = published behaviour.
+    swi_api_taus: Optional[Sequence[int]] = None
 
     def __post_init__(self):
         """Validate configuration"""
@@ -97,6 +108,9 @@ class ModelConfig:
     hidden_dim: int = 32
     dropout: float = 0.4
     num_layers: int = 1
+    # B4: initialise the LSTM forget-gate bias to this value (Jozefowicz et al. 2015).
+    # None = PyTorch default (uniform), i.e. published behaviour.
+    forget_gate_bias_init: Optional[float] = None
     
     def __post_init__(self):
         """Validate model config"""

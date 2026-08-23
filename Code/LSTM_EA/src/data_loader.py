@@ -74,6 +74,58 @@ def _add_annual_precip_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _add_swi_api_channels(df: pd.DataFrame, taus, logger) -> pd.DataFrame:
+    """
+    D1: add SWI_T and API_T channels for each characteristic timescale T (days).
+
+    SWI is the Wagner et al. (1999) exponential filter on surface soil moisture:
+        K_n   = K_{n-1} / (K_{n-1} + exp(-dt / T))
+        SWI_n = SWI_{n-1} + K_n * (SSM_n - SWI_{n-1})
+    API is the standard antecedent precipitation index:
+        API_n = API_{n-1} * exp(-dt / T) + P_n
+
+    Both use the real day gap dt between consecutive rows, so a break in the record
+    decays the state rather than treating the rows as adjacent.  NaN SSM carries the
+    state forward without updating.  Called BEFORE the month filter so the recursion
+    runs on the continuous daily record instead of restarting each April - which is
+    what makes the T=60 channel meaningful.
+    """
+    ssm_col = 'SSM_avg' if 'SSM_avg' in df.columns else ('SSM' if 'SSM' in df.columns else None)
+    p_col = next((c for c in PRECIP_COLS if c in df.columns), None)
+    if ssm_col is None and p_col is None:
+        logger.warning("SWI/API requested but neither SSM nor precip columns found")
+        return df
+
+    dates = pd.to_datetime(df['Date'])
+    dt = dates.diff().dt.days.fillna(1.0).clip(lower=1.0).to_numpy()
+    ssm = df[ssm_col].to_numpy(dtype=float) if ssm_col else None
+    prcp = pd.to_numeric(df[p_col], errors='coerce').fillna(0.0).to_numpy(dtype=float) if p_col else None
+
+    for T in taus:
+        if ssm is not None:
+            swi = np.full(len(df), np.nan)
+            state, K = np.nan, 1.0
+            for i in range(len(df)):
+                if np.isnan(state):
+                    if not np.isnan(ssm[i]):
+                        state, K = ssm[i], 1.0
+                elif not np.isnan(ssm[i]):
+                    K = K / (K + np.exp(-dt[i] / T))
+                    state = state + K * (ssm[i] - state)
+                swi[i] = state
+            df[f'swi_{T}'] = swi
+        if prcp is not None:
+            api = np.zeros(len(df))
+            state = 0.0
+            for i in range(len(df)):
+                state = state * np.exp(-dt[i] / T) + prcp[i]
+                api[i] = state
+            df[f'api_{T}'] = api
+    logger.info(f"  Added SWI/API channels for T={list(taus)} "
+                f"(ssm={ssm_col}, precip={p_col})")
+    return df
+
+
 class DataProcessor:
     """
     Handles all data loading, cleaning, and windowing operations.
@@ -168,8 +220,12 @@ class DataProcessor:
             
             # Validate required columns (exclude irrigation, computed precip, and Presto emb_* merged later)
             computed_static = {'precip_jan_apr', 'precip_may_oct'}
+            # swi_*/api_* are derived in-loader (D1), so exempt them from the input check
+            computed_dynamic = {c for c in dynamic_cols
+                                if c.startswith('swi_') or c.startswith('api_')}
             base_static = [c for c in static_cols if c not in computed_static and not (c.startswith('emb_'))]
-            base_required = [col for col in self.feature_config.dynamic_cols if col != 'irrigation'] + base_static + [target_col, 'Date']
+            base_required = [col for col in self.feature_config.dynamic_cols
+                             if col != 'irrigation' and col not in computed_dynamic] + base_static + [target_col, 'Date']
             missing_cols = set(base_required) - set(df.columns)
             if missing_cols:
                 logger.error(f"Missing columns in {filepath}: {missing_cols}")
@@ -197,6 +253,10 @@ class DataProcessor:
             # Add Year and accumulated precipitation (from full-year data) before month filter
             df['Year'] = df['Date'].dt.year
             df = _add_annual_precip_features(df)
+
+            # D1: SWI/API on the continuous record, before the month filter
+            if getattr(self.data_config, 'swi_api_taus', None):
+                df = _add_swi_api_channels(df, self.data_config.swi_api_taus, logger)
 
             # Optional: restrict to a range of months (e.g. May–October)
             if self.data_config.month_range is not None:
@@ -363,6 +423,7 @@ class DataProcessor:
         all_windows = []
         all_dates = []  # last date of each window (target date)
         skipped_year = 0
+        skipped_gap = 0
         skipped_nan = 0
         skipped_target_nan = 0
         interpolated_count = 0
@@ -374,6 +435,14 @@ class DataProcessor:
             if self.data_config.same_year_constraint and window['Year'].nunique() > 1:
                 skipped_year += 1
                 continue
+
+            # A4: the slice above is positional, so a gap in the daily record yields a
+            # window covering more calendar days than seq_length.  Require contiguity.
+            if getattr(self.data_config, 'require_contiguous_windows', False):
+                span = (window['Date'].iloc[-1] - window['Date'].iloc[0]).days + 1
+                if span != seq_length:
+                    skipped_gap += 1
+                    continue
             
             # Drop window if target has any NaN (no interpolation for target)
             if window[target_col].isna().any():
@@ -481,6 +550,8 @@ class DataProcessor:
             logger.info(f"  Skipped {skipped_year} windows (different years)")
         if skipped_target_nan > 0:
             logger.info(f"  Skipped {skipped_target_nan} windows (target had NaN)")
+        if skipped_gap > 0:
+            logger.info(f"  Skipped {skipped_gap} windows (non-contiguous dates, span != {seq_length}d)")
         if skipped_nan > 0:
             logger.info(f"  Skipped {skipped_nan} windows (features NaN > {nan_threshold*100:.0f}%)")
         if interpolated_count > 0:
@@ -657,8 +728,18 @@ class DataProcessor:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 # Fill NaN in static (e.g. Presto merge misses) so scaler.transform does not fail
                 if static_cols_for_scaling:
-                    static_vals = df[static_cols_for_scaling].fillna(0.0)
-                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    n_nan = int(df[static_cols_for_scaling].isna().sum().sum())
+                    if getattr(self.data_config, 'impute_statics_after_scaling', False):
+                        # A3: scale first (StandardScaler propagates NaN), then fill with 0
+                        # in z-space, i.e. the training mean rather than an arbitrary z-score.
+                        scaled = self.scaler_stat.transform(df[static_cols_for_scaling])
+                        df_scaled[static_cols_for_scaling] = np.nan_to_num(scaled, nan=0.0)
+                    else:
+                        static_vals = df[static_cols_for_scaling].fillna(0.0)
+                        df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    if n_nan:
+                        logger.info(f"  Static NaNs imputed: {n_nan} "
+                                    f"({'after' if getattr(self.data_config, 'impute_statics_after_scaling', False) else 'before'} scaling)")
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)
@@ -687,8 +768,18 @@ class DataProcessor:
                 if irrigation_as_static and 'irrigation' in df.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 if static_cols_for_scaling:
-                    static_vals = df[static_cols_for_scaling].fillna(0.0)
-                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    n_nan = int(df[static_cols_for_scaling].isna().sum().sum())
+                    if getattr(self.data_config, 'impute_statics_after_scaling', False):
+                        # A3: scale first (StandardScaler propagates NaN), then fill with 0
+                        # in z-space, i.e. the training mean rather than an arbitrary z-score.
+                        scaled = self.scaler_stat.transform(df[static_cols_for_scaling])
+                        df_scaled[static_cols_for_scaling] = np.nan_to_num(scaled, nan=0.0)
+                    else:
+                        static_vals = df[static_cols_for_scaling].fillna(0.0)
+                        df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    if n_nan:
+                        logger.info(f"  Static NaNs imputed: {n_nan} "
+                                    f"({'after' if getattr(self.data_config, 'impute_statics_after_scaling', False) else 'before'} scaling)")
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)

@@ -83,26 +83,58 @@ cp -p outputs/spatial_transferability/spatial_transferability_metrics.csv{,.bak}
 
 Ordered with the verified ones first.
 
-1. **Table 3's exponential-filter column no longer reproduces.** Confirmed by rerun.
+1. **BUG — the exponential filter silently evaluates at 50 cm while reporting 25 cm.**
 
-   | | published (Mar 10 run) | current code+data (Mar 16 run) |
-   |---|---|---|
-   | US-Ne1 | R² 0.3697, best T=1 | R² 0.0095, best T=4 |
-   | US-Ne2 | R² −1.6995, best T=1 | R² −1.7842, best T=5 |
-   | US-Ne3 | R² 0.3514, best T=1 | R² 0.3032, best T=1 |
-   | Average | **−0.3261** | **−0.4905** |
+   `load_station_data()` in `run_exp_filter_out_of_year_single_station.py` mutates the config
+   it is passed:
 
-   The Mar-10 run selected T=1 at all three sites; the current one selects 1/5/4, and the
-   training-fold NSE values differ too (Ne3 fold 0.0519 → 0.3621), so the T-selection input
-   changed, not just the tie-breaking. Compare
-   `outputs/exp_filter_spatial_cv/experiment_20260310_095448.log` (published) against
-   `experiment_20260316_095859.log` (current). `run_exp_filter_spatial_cv.py` has only one
-   commit in git history, so the Mar-10 version of the script is not recoverable from the repo.
+   ```python
+   if "RZSM_50_avg" in df.columns and df["RZSM_50_avg"].notna().any():
+       target_col = "RZSM_50_avg"
+   elif "RZSM_25_avg" in df.columns and ...:
+       target_col = "RZSM_25_avg"
+   config.target_col = target_col          # <-- side effect on the caller's config
+   ```
 
-   Manuscript text affected: the abstract's "exponential filter failed entirely (R² = −0.33)"
-   and §4.4's "reasonable performance at US-Ne1 (R² = 0.370) and US-Ne3 (R² = 0.351)" — under
-   the current code US-Ne1 is 0.009, i.e. no skill, which strengthens the paper's argument but
-   changes the sentence.
+   `RZSM_50_avg` is non-NaN in all three station files (9 997–11 694 rows), so the 50 cm branch
+   is **always** taken and the 25 cm branch is dead code. The first `load_station_data()` call
+   flips `config.target_col` from `RZSM_25_avg` to `RZSM_50_avg`, and every later use — T
+   optimisation, pooled norms, `y_true`, all metrics — is then 50 cm. The banner line
+   `Target: RZSM_25_avg` is logged *before* the first load, so the logs claim 25 cm throughout.
+
+   Verified directly: `y_true` in both exponential-filter prediction CSVs matches `RZSM_50_avg`
+   to 0.00000 and differs from `RZSM_25_avg` by 1.6–2.7 m³/m³ at every station. The LSTM and RF
+   prediction files match `RZSM_25_avg` to 0.00000, so **the bug is confined to the exponential
+   filter** — both scripts share this loader; the ML pipelines use `src/data_loader.py` instead.
+
+   Consequences for the two tables:
+
+   | | exp-filter column | depth actually evaluated | status |
+   |---|---|---|---|
+   | **Table 3** (spatial), published | Mar-10 run, T=1/1/1, mean R² −0.3261 | **25 cm** | correct |
+   | Table 3 (spatial), current code | Mar-16 run, T=1/5/4, mean R² −0.4905 | 50 cm | wrong |
+   | **Table 2** (temporal), published | Mar-16 predictions, mean R² 0.5012 | 50 cm | **wrong — in the paper** |
+
+   So the *published* Table 3 is right and the current code is wrong, while the *published*
+   Table 2 already carries the bug. Table 2's RF and LSTM columns are unaffected (genuine 25 cm),
+   which makes that row internally inconsistent: two models at 25 cm, one at 50 cm.
+
+   Manuscript text affected: everything resting on the temporal exponential filter — the
+   abstract's "exponential filter (R² = 0.50)" and §4.3's "at the rainfed US-Ne3 site, the
+   exponential filter (R² = 0.814) ... the soil system behaves largely as a low-pass filter",
+   plus Figs 5 and 6.
+
+   Corroborating evidence for the Mar-10 → Mar-16 change: pooled RZSM norms in the logs.
+   Mar-10 fold3 logs `RZSM [16.06, 41.33]`, which is exactly `min/max(RZSM_25_avg)` over Ne2+Ne3;
+   Mar-16 logs `[19.61, 43.71]`, exactly `min/max(RZSM_50_avg)` over the same pair. SSM norms and
+   all row counts are byte-identical between the runs, and `Data/Base/*.csv` have not been touched
+   since 2025-12-19 — the input data did not change, the code did. `run_exp_filter_spatial_cv.py`
+   has mtime 2026-03-12 23:58, inside the window; both exponential-filter scripts were untracked
+   until the 2026-08-22 baseline commit, so the Mar-10 version is not recoverable from git.
+
+   **Fix:** stop mutating the caller's config — have `load_station_data` honour
+   `config.target_col` as given (or return the resolved name instead of assigning it), then
+   re-run both exponential-filter scripts and regenerate Tables 2 and 3.
 
 2. **Fig 10's temporal values are hardcoded and contradict the outputs.**
    `plot_transfer_r2_vs_depth.py` sets `TEMPORAL_50_MANUAL = {0.37, 0.50, 0.73}` and

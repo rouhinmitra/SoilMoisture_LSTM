@@ -197,7 +197,8 @@ class StandardLSTM(nn.Module):
         stat_dim: int, 
         hidden_dim: int, 
         dropout: float = 0.4,
-        num_layers: int = 1
+        num_layers: int = 1,
+        forget_gate_bias_init: float = None
     ):
         super().__init__()
         
@@ -211,11 +212,24 @@ class StandardLSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
+        # B4: PyTorch bias layout per layer is [i | f | g | o], each of size hidden_dim.
+        # bias_ih and bias_hh are summed, so setting ih's forget chunk and zeroing hh's
+        # gives a net forget bias of exactly `forget_gate_bias_init`.  Deterministic
+        # assignment - consumes no RNG, so seeding is unaffected.
+        if forget_gate_bias_init is not None:
+            with torch.no_grad():
+                for layer in range(num_layers):
+                    getattr(self.lstm, f'bias_ih_l{layer}')[hidden_dim:2 * hidden_dim] \
+                        .fill_(float(forget_gate_bias_init))
+                    getattr(self.lstm, f'bias_hh_l{layer}')[hidden_dim:2 * hidden_dim] \
+                        .fill_(0.0)
+
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(hidden_dim, 1)
         
         logger.info(f"Created StandardLSTM: input_dim={input_dim}, "
-                   f"hidden_dim={hidden_dim}, num_layers={num_layers}, dropout={dropout}")
+                   f"hidden_dim={hidden_dim}, num_layers={num_layers}, dropout={dropout}, "
+                   f"forget_bias_init={forget_gate_bias_init}")
         
     def forward(
         self, 
@@ -279,6 +293,7 @@ def get_model(model_config: ModelConfig, dyn_dim: int, stat_dim: int) -> nn.Modu
             stat_dim=stat_dim,
             hidden_dim=model_config.hidden_dim,
             dropout=model_config.dropout,
+            forget_gate_bias_init=getattr(model_config, 'forget_gate_bias_init', None),
             num_layers=model_config.num_layers
         )
     else:
