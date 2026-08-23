@@ -120,10 +120,15 @@ VARIANTS = {
         # OUTCOME (15 seeds vs 15-seed paper_config_fixed): RESOLVED NEGATIVE.
         # Ne1 -0.046 [-0.078,-0.014], Ne2 -0.068 [-0.105,-0.031], Ne3 -0.021 (inside floor).
         # Year-level sigma exploded (Ne3 0.164 -> 0.588), driving whole site-years negative.
-        # Mechanism checked and it is NOT out-of-distribution blowup: gamma_diag.py over
-        # seeds 42/1 shows held-out-site ||z|| overlapping the training range (ratio
-        # 0.97-1.28) with only ~1-4% of z/gamma values outside the per-unit train envelope.
-        # Conclusion: ordinary overfitting of a ~5k-parameter encoder on two sites.
+        # Mechanism settled at 15 seeds (gamma_diag15.py): NOT extrapolation.  Per-seed
+        # out-of-range rate at the held-out site does not predict damage - all four
+        # measures correlate POSITIVELY and non-significantly with Ne3 R2 (pearson
+        # +0.26..+0.40, p>=0.14, n=15).  The extreme-OOR seed (2, 25.6% OOR) is one of
+        # the BEST seeds (Ne3 R2 0.761).  Conclusion: ordinary overfitting of a ~5k-param
+        # encoder on two sites.
+        # Caveat found in the same run: ||z|| tracks zero-padding fraction
+        # (corr -0.33..-0.70), so the encoder partly encodes calendar position via the
+        # year-boundary clipping of the 60-day context.
         # Recorded 2026-08-23.
     },
 }
@@ -214,9 +219,10 @@ def main() -> int:
         np.random.seed(seed)
 
         label = args.variant if len(seeds) == 1 else f"{args.variant}_seed{seed}"
-        # Seed-tag the fold directories so checkpoints from earlier seeds are not
-        # overwritten by later ones (needed for any post-hoc weight diagnostics).
-        config.output_dir = str(out_dir / f"seed{seed}") if len(seeds) > 1 else str(out_dir)
+        # Seed-tag the fold directories ALWAYS.  Checkpoints being overwritten by the
+        # next seed has cost us two diagnostics; the per-seed layout is now permanent
+        # regardless of how many seeds a run covers.
+        config.output_dir = str(out_dir / f"seed{seed}")
         log.info("=" * 70)
         log.info("SEED %d  ->  variant label %r", seed, label)
         log.info("=" * 70)
