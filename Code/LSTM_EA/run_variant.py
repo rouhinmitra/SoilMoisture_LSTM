@@ -99,6 +99,25 @@ VARIANTS = {
         "impute_statics_after_scaling": True,
         "swi_api_taus": (5, 20, 60),
     },
+
+    # D2: context/FiLM encoder.  60-day dynamic history -> conv encoder -> z (12 dims);
+    # StandardLSTM modulates its final hidden state by FiLM(z).  Window acceptance is
+    # unchanged, so this is measured on exactly the baseline evaluation set.
+    "d2_context_film": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "context_length": 60,
+        "context_dim": 12,
+        "context_encoder_type": "conv",
+    },
 }
 
 
@@ -187,6 +206,9 @@ def main() -> int:
         np.random.seed(seed)
 
         label = args.variant if len(seeds) == 1 else f"{args.variant}_seed{seed}"
+        # Seed-tag the fold directories so checkpoints from earlier seeds are not
+        # overwritten by later ones (needed for any post-hoc weight diagnostics).
+        config.output_dir = str(out_dir / f"seed{seed}") if len(seeds) > 1 else str(out_dir)
         log.info("=" * 70)
         log.info("SEED %d  ->  variant label %r", seed, label)
         log.info("=" * 70)

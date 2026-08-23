@@ -82,6 +82,9 @@ class CVConfig:
     impute_statics_after_scaling: bool = False # A3
     forget_gate_bias_init: Optional[float] = None  # B4
     swi_api_taus: Optional[Sequence[int]] = None   # D1
+    context_length: Optional[int] = None           # D2 (history fed to the encoder)
+    context_dim: Optional[int] = None              # D2 (width of z; None = off)
+    context_encoder_type: str = "conv"             # D2
 
     # Presto embeddings as static features (added to Alpha Earth when True)
     use_presto_static: bool = True
@@ -151,6 +154,7 @@ def run_single_fold(
         require_contiguous_windows=config.require_contiguous_windows,
         impute_statics_after_scaling=config.impute_statics_after_scaling,
         swi_api_taus=config.swi_api_taus,
+        context_length=config.context_length,
     )
 
     # Resolve Presto embeddings path (relative to LSTM_EA project root)
@@ -187,6 +191,8 @@ def run_single_fold(
         dropout=config.dropout,
         num_layers=config.num_layers,
         forget_gate_bias_init=config.forget_gate_bias_init,
+        context_dim=config.context_dim,
+        context_encoder_type=config.context_encoder_type,
     )
     
     training_config = TrainingConfig(

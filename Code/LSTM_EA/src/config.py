@@ -35,6 +35,10 @@ class DataConfig:
     # D1: add SWI (exponential-filter soil water index) and API (antecedent precipitation
     # index) channels at these characteristic timescales, in days.  None = published behaviour.
     swi_api_taus: Optional[Sequence[int]] = None
+    # D2: emit `context_length` timesteps of dynamic history per window (>= seq_length).
+    # Window ACCEPTANCE is unchanged - only the dynamic tensor is extended backwards -
+    # so the evaluation set stays identical to the baseline.  None = published behaviour.
+    context_length: Optional[int] = None
 
     def __post_init__(self):
         """Validate configuration"""
@@ -111,6 +115,9 @@ class ModelConfig:
     # B4: initialise the LSTM forget-gate bias to this value (Jozefowicz et al. 2015).
     # None = PyTorch default (uniform), i.e. published behaviour.
     forget_gate_bias_init: Optional[float] = None
+    # D2: context/FiLM encoder.  context_dim = width of z; None = encoder disabled.
+    context_dim: Optional[int] = None
+    context_encoder_type: str = "conv"   # "conv" or "gru"
     
     def __post_init__(self):
         """Validate model config"""

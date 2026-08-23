@@ -501,6 +501,22 @@ class DataProcessor:
             # Extract features and target (target is raw, never interpolated)
             try:
                 X_dynamic = window_interpolated[dynamic_cols].values  # (seq_length, num_dyn_features)
+
+                # D2: extend the dynamic tensor backwards to context_length timesteps.
+                # Acceptance of this window was already decided above on the prediction
+                # window alone, so n is unchanged.  History is restricted to the same
+                # calendar year and left-padded with zeros; the frame is already scaled
+                # at this point, so zero == the training mean, not a spurious extreme.
+                ctx_len = getattr(self.data_config, 'context_length', None)
+                if ctx_len and ctx_len > seq_length:
+                    lo = max(0, i - (ctx_len - seq_length))
+                    hist = df.iloc[lo:i + seq_length]
+                    hist = hist[hist['Year'] == window['Year'].iloc[-1]]
+                    Xh = hist[dynamic_cols].to_numpy(dtype=float)
+                    Xh = np.nan_to_num(Xh, nan=0.0)
+                    if len(Xh) < ctx_len:
+                        Xh = np.vstack([np.zeros((ctx_len - len(Xh), Xh.shape[1])), Xh])
+                    X_dynamic = Xh[-ctx_len:]
                 y = window[target_col].values  # (seq_length,) - use raw target, no interpolation
                 if use_presto:
                     year = int(window_interpolated['Year'].iloc[0])
@@ -524,9 +540,12 @@ class DataProcessor:
                 else:
                     X_static = X_static_base
                 
-                # Validate shapes
-                if X_dynamic.shape != (seq_length, len(dynamic_cols)):
-                    logger.warning(f"Unexpected dynamic feature shape: {X_dynamic.shape}")
+                # Validate shapes.  Under D2 the dynamic tensor legitimately carries
+                # context_length timesteps while the static tensor keeps seq_length.
+                expected_dyn_len = ctx_len if (ctx_len and ctx_len > seq_length) else seq_length
+                if X_dynamic.shape != (expected_dyn_len, len(dynamic_cols)):
+                    logger.warning(f"Unexpected dynamic feature shape: {X_dynamic.shape}, "
+                                   f"expected ({expected_dyn_len}, {len(dynamic_cols)})")
                     continue
                 expected_static_dim = X_static_base.shape[1] + (1 if irrigation_as_static else 0)
                 if X_static.shape != (seq_length, expected_static_dim):
