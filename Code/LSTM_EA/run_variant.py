@@ -117,6 +117,14 @@ VARIANTS = {
         "context_length": 60,
         "context_dim": 12,
         "context_encoder_type": "conv",
+        # OUTCOME (15 seeds vs 15-seed paper_config_fixed): RESOLVED NEGATIVE.
+        # Ne1 -0.046 [-0.078,-0.014], Ne2 -0.068 [-0.105,-0.031], Ne3 -0.021 (inside floor).
+        # Year-level sigma exploded (Ne3 0.164 -> 0.588), driving whole site-years negative.
+        # Mechanism checked and it is NOT out-of-distribution blowup: gamma_diag.py over
+        # seeds 42/1 shows held-out-site ||z|| overlapping the training range (ratio
+        # 0.97-1.28) with only ~1-4% of z/gamma values outside the per-unit train envelope.
+        # Conclusion: ordinary overfitting of a ~5k-parameter encoder on two sites.
+        # Recorded 2026-08-23.
     },
 }
 
