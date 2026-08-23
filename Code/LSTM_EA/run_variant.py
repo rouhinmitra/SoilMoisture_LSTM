@@ -32,7 +32,91 @@ BASE = Path(__file__).resolve().parent
 # 'baseline' is empty by construction, so it reproduces run_cv.py.
 VARIANTS = {
     "baseline": {},
-    "no_irrigation_static": {"exclude_irrigation_static": True},
+    # NOTE: the pre-2026-08-23 "no_irrigation_static" was anchored to run_cv.py's tuned
+    # defaults and run at a single seed; it is superseded by A1 below.  Its old row in
+    # summary_metrics.csv is the unsuffixed 'no_irrigation_static' - do not compare it
+    # against the paper_config_fixed family.
+
+    # ---- Static ablations, all anchored on paper_config_fixed -------------------
+    # Test of the over-conditioning thesis: does removing site-identifying statics
+    # help spatial transfer?  No new code - only feature selection.
+
+    # A1: drop the auto-appended irrigation static (the manuscript-relevant one).
+    "no_irrigation_static": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "exclude_irrigation_static": True,
+    },
+
+    # A1b: drop the 128 Presto embedding dims (static dim 193 -> 65, +1 irrigation).
+    "no_presto_static": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "use_presto_static": False,
+        "static_cols": [f'A{i:02d}' for i in range(64)] + ['precip_jan_apr'],
+    },
+
+    # A1c: both.
+    "no_presto_no_irrigation": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "use_presto_static": False,
+        "static_cols": [f'A{i:02d}' for i in range(64)] + ['precip_jan_apr'],
+        "exclude_irrigation_static": True,
+    },
+
+    # ---- V-REx: penalise the variance of per-environment (site x year) risks ----
+    # Targets the year-level sigma rather than the mean.  Two weights to bracket.
+    "vrex_w1": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "vrex_weight": 1.0,
+    },
+    "vrex_w10": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "vrex_weight": 10.0,
+    },
 
     # The Mar-04 configuration that produced Table 3 (Ne1 0.5192 / Ne2 0.6729 /
     # Ne3 0.6790).  Not recoverable from git - the Mar-04 tree had uncommitted

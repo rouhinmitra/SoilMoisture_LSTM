@@ -816,7 +816,27 @@ class DataProcessor:
         if not X_d_test_list:
             raise ValueError("No valid test samples created!")
         
+        # Environment ids for group-wise objectives (V-REx, and later E1/D3).
+        # One id per window: site x calendar year of the window's target date.
+        def _groups(files, dates_list):
+            labels = []
+            for fp, dts in zip(files, dates_list):
+                site = _site_from_filepath(fp) or Path(fp).stem
+                labels.extend(f"{site}_{pd.Timestamp(d).year}" for d in dts)
+            return labels
+
+        train_labels = _groups(train_files, dates_train_list)
+        test_labels = _groups(test_files, dates_test_list)
+        vocab = {g: i for i, g in enumerate(sorted(set(train_labels) | set(test_labels)))}
+        groups_train = np.array([vocab[g] for g in train_labels], dtype=np.int64)
+        groups_test = np.array([vocab[g] for g in test_labels], dtype=np.int64)
+        logger.info(f"Environments (site x year): {len(set(train_labels))} in train, "
+                    f"{len(set(test_labels))} in test")
+
         result = {
+            'groups_train': groups_train,
+            'groups_test': groups_test,
+            'group_vocab': vocab,
             'X_d_train': np.concatenate(X_d_train_list),
             'X_s_train': np.concatenate(X_s_train_list),
             'y_train': np.concatenate(y_train_list),
@@ -854,7 +874,8 @@ class RZSMDataset(Dataset):
         Target values, shape (num_samples, seq_length)
     """
     
-    def __init__(self, x_d: np.ndarray, x_s: np.ndarray, y: np.ndarray):
+    def __init__(self, x_d: np.ndarray, x_s: np.ndarray, y: np.ndarray,
+                 groups: np.ndarray = None):
         if len(x_d) == 0 or len(x_s) == 0 or len(y) == 0:
             raise ValueError("Cannot create dataset from empty arrays")
         
@@ -864,6 +885,10 @@ class RZSMDataset(Dataset):
         self.x_d = torch.tensor(x_d, dtype=torch.float32)
         self.x_s = torch.tensor(x_s, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        # Environment id per sample; zeros when the caller supplies none, so the
+        # 4-tuple contract holds everywhere regardless of objective.
+        self.groups = (torch.zeros(len(y), dtype=torch.long) if groups is None
+                       else torch.as_tensor(np.asarray(groups), dtype=torch.long))
         
         # Check for NaN or Inf
         if torch.isnan(self.x_d).any() or torch.isinf(self.x_d).any():
@@ -881,7 +906,7 @@ class RZSMDataset(Dataset):
     def __len__(self) -> int:
         return len(self.y)
     
-    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.x_d[i], self.x_s[i], self.y[i]
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.x_d[i], self.x_s[i], self.y[i], self.groups[i]
 
 

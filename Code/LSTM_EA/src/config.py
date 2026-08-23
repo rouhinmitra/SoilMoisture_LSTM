@@ -154,6 +154,9 @@ class TrainingConfig:
             raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
         if self.weight_decay < 0:
             raise ValueError(f"weight_decay must be >= 0, got {self.weight_decay}")
+    # V-REx: weight on the variance of per-environment training losses.
+    # 0.0 = plain ERM = published behaviour.
+    vrex_weight: float = 0.0
 
 
 @dataclass

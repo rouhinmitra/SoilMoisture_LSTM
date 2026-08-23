@@ -85,6 +85,7 @@ class CVConfig:
     context_length: Optional[int] = None           # D2 (history fed to the encoder)
     context_dim: Optional[int] = None              # D2 (width of z; None = off)
     context_encoder_type: str = "conv"             # D2
+    vrex_weight: float = 0.0                       # V-REx penalty weight (0 = ERM)
 
     # Presto embeddings as static features (added to Alpha Earth when True)
     use_presto_static: bool = True
@@ -200,7 +201,8 @@ def run_single_fold(
         epochs=config.epochs,
         learning_rate=config.learning_rate,
         early_stopping_patience=config.early_stopping_patience,
-        weight_decay=config.weight_decay
+        weight_decay=config.weight_decay,
+        vrex_weight=config.vrex_weight,
     )
     
     # Prepare data
@@ -214,8 +216,10 @@ def run_single_fold(
     )
     
     # Create datasets
-    full_train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'])
-    test_dataset = RZSMDataset(data['X_d_test'], data['X_s_test'], data['y_test'])
+    full_train_dataset = RZSMDataset(data['X_d_train'], data['X_s_train'], data['y_train'],
+                                     groups=data.get('groups_train'))
+    test_dataset = RZSMDataset(data['X_d_test'], data['X_s_test'], data['y_test'],
+                               groups=data.get('groups_test'))
     
     # Split training data into train/val: either by year (val_years) or random fraction (val_fraction)
     dates_train = data['dates_train']

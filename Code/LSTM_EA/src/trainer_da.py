@@ -168,17 +168,17 @@ class DANNTrainer:
         for _ in range(n_batches):
             # Get source batch
             try:
-                x_d_src, x_s_src, y_src = next(source_iter)
+                x_d_src, x_s_src, y_src, _g_src = next(source_iter)
             except StopIteration:
                 source_iter = iter(source_loader)
-                x_d_src, x_s_src, y_src = next(source_iter)
+                x_d_src, x_s_src, y_src, _g_src = next(source_iter)
             
             # Get target batch
             try:
-                x_d_tgt, x_s_tgt, _ = next(target_iter)  # Ignore labels
+                x_d_tgt, x_s_tgt, _, _g_tgt = next(target_iter)  # Ignore labels
             except StopIteration:
                 target_iter = iter(target_loader)
-                x_d_tgt, x_s_tgt, _ = next(target_iter)
+                x_d_tgt, x_s_tgt, _, _g_tgt = next(target_iter)
             
             # Move to device
             x_d_src = x_d_src.to(self.device)
@@ -265,7 +265,7 @@ class DANNTrainer:
         total_loss = 0.0
         num_batches = 0
         
-        for x_d, x_s, y in val_loader:
+        for x_d, x_s, y, g in val_loader:
             x_d = x_d.to(self.device)
             x_s = x_s.to(self.device)
             y = y.to(self.device)
