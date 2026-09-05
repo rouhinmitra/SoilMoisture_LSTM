@@ -136,6 +136,32 @@ VARIANTS = {
 
     # paper_config + the two data-path correctness fixes.  This is the anchor for
     # all architecture work; paper_config itself stays as the as-published reference.
+    # ---- Soil hydraulic properties as statics (STEP 1 of the soil-properties test) ----
+    # Anchored on paper_config_fixed; the ONLY delta is +2 static columns.
+    # field_capacity_60cm and wilting_point_60cm are CONSTANT PER SITE, so at n=3
+    # sites they are exact site indicators; a LOSO fold shows the model two distinct
+    # values and asks it to extrapolate to an unseen third.  Only these two of the 14
+    # soil columns are used - adding all of them would be indistinguishable from
+    # adding a site one-hot.
+    # PRE-REGISTERED PREDICTION (recorded before the run): this should FAIL, by the
+    # same over-conditioning mechanism as D2 and the Presto ablation.
+    "soil_static_fc_wp": {
+        "hidden_dim": 32,
+        "num_layers": 1,
+        "dropout": 0.5,
+        "batch_size": 32,
+        "learning_rate": 0.0005,
+        "early_stopping_patience": 20,
+        "epochs": 150,
+        "weight_decay": 0.001,
+        "require_contiguous_windows": True,
+        "impute_statics_after_scaling": True,
+        "static_cols": ([f'emb_{k}' for k in range(128)]
+                        + [f'A{i:02d}' for i in range(64)]
+                        + ['precip_jan_apr',
+                           'field_capacity_60cm', 'wilting_point_60cm']),
+    },
+
     "paper_config_fixed": {
         "hidden_dim": 32,
         "num_layers": 1,
