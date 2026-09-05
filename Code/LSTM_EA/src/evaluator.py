@@ -75,7 +75,7 @@ class Evaluator:
         predictions = []
         actuals = []
         
-        for x_d, x_s, y in data_loader:
+        for x_d, x_s, y, g in data_loader:
             x_d = x_d.to(self.device)
             x_s = x_s.to(self.device)
             

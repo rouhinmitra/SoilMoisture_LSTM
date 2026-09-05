@@ -1,0 +1,56 @@
+# EA-LSTM with Presto geospatial embeddings as static features
+# Replaces Alpha Earth (A00-A63) with 128-d Presto embeddings per (site, year).
+# Requires a precomputed Presto embeddings file (see PRESTO_INTEGRATION.md).
+
+name: "presto_ealstm"
+
+data:
+  train_files:
+    - "ne1_1_maize.csv"
+    - "ne2_1_maize.csv"
+  test_files:
+    - "ne3_1_maize.csv"
+  data_dir: "/Users/rouhinmitra/SM_work/Data/Base/"
+  seq_length: 30
+  nan_threshold: 0.1
+  same_year_constraint: true
+
+features:
+  dynamic_cols:
+    - "SSM"
+    - "SSM_avg"
+    - "SWC_PI_F_2_1_1"
+    - "SWC_PI_F_3_1_1"
+    - "P_PI_F_1_1_1"
+    - "P_PI_F_2_2_1"
+    - "I"
+    - "TA_1_1_1"
+    - "RH_1_1_1"
+  static_cols: "A00-A63"   # ignored when use_presto_static=true; becomes precip only
+  use_presto_static: true
+  presto_embeddings_path: "presto_embeddings.csv"   # CSV: site,year,e0..e127
+  target_col: "RZSM_25_avg"
+  add_temporal: false
+  temporal_features:
+    - "doy_sin"
+    - "doy_cos"
+
+model:
+  model_type: "EALSTM"
+  hidden_dim: 32
+  dropout: 0.4
+  num_layers: 1
+
+training:
+  batch_size: 64
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.001
+  early_stopping_patience: 10
+  gradient_clip: 1.0
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+seed: 42
+output_dir: "outputs"
+log_level: "INFO"

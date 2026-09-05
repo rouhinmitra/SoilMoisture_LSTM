@@ -3,7 +3,7 @@ Configuration management for EA-LSTM experiments.
 Uses dataclasses for typed configuration with validation.
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Sequence
 import yaml
 from pathlib import Path
 import logging
@@ -24,6 +24,21 @@ class DataConfig:
     month_range: Optional[Tuple[int, int]] = None
     # Optional (min_year, max_year) inclusive. None = use all years.
     year_range: Optional[Tuple[int, int]] = None
+    # A4: drop windows whose calendar span exceeds seq_length days.  Windows are
+    # sliced by ROW position, so a gap in the daily record silently produces a
+    # window spanning more days than seq_length.  Default False = published behaviour.
+    require_contiguous_windows: bool = False
+    # A3: impute missing statics AFTER scaling (fill with 0 in z-space = the
+    # training mean) instead of before (raw 0.0 -> an arbitrary z-score).
+    # Default False = published behaviour.
+    impute_statics_after_scaling: bool = False
+    # D1: add SWI (exponential-filter soil water index) and API (antecedent precipitation
+    # index) channels at these characteristic timescales, in days.  None = published behaviour.
+    swi_api_taus: Optional[Sequence[int]] = None
+    # D2: emit `context_length` timesteps of dynamic history per window (>= seq_length).
+    # Window ACCEPTANCE is unchanged - only the dynamic tensor is extended backwards -
+    # so the evaluation set stays identical to the baseline.  None = published behaviour.
+    context_length: Optional[int] = None
 
     def __post_init__(self):
         """Validate configuration"""
@@ -97,6 +112,12 @@ class ModelConfig:
     hidden_dim: int = 32
     dropout: float = 0.4
     num_layers: int = 1
+    # B4: initialise the LSTM forget-gate bias to this value (Jozefowicz et al. 2015).
+    # None = PyTorch default (uniform), i.e. published behaviour.
+    forget_gate_bias_init: Optional[float] = None
+    # D2: context/FiLM encoder.  context_dim = width of z; None = encoder disabled.
+    context_dim: Optional[int] = None
+    context_encoder_type: str = "conv"   # "conv" or "gru"
     
     def __post_init__(self):
         """Validate model config"""
@@ -133,6 +154,9 @@ class TrainingConfig:
             raise ValueError(f"learning_rate must be > 0, got {self.learning_rate}")
         if self.weight_decay < 0:
             raise ValueError(f"weight_decay must be >= 0, got {self.weight_decay}")
+    # V-REx: weight on the variance of per-environment training losses.
+    # 0.0 = plain ERM = published behaviour.
+    vrex_weight: float = 0.0
 
 
 @dataclass

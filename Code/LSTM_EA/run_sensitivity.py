@@ -24,7 +24,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 from copy import deepcopy
 import logging
 import time
@@ -45,7 +45,7 @@ ALL_DYNAMIC = [
 
 SSM_FEATURES = {'SSM', 'SSM_avg', 'SWC_PI_F_2_1_1', 'SWC_PI_F_3_1_1'}
 PRECIP_FEATURES_DYN = {'P_PI_F_1_1_1', 'P_PI_F_2_2_1', 'I'}
-PRECIP_FEATURES_STAT = {'precip_jan_apr', 'precip_may_oct'}
+PRECIP_FEATURES_STAT = {'precip_jan_apr'}
 METEO_FEATURES = {'TA_1_1_1', 'RH_1_1_1', 'LE_1_1_1', 'NETRAD_1_1_1'}
 S2_FEATURES = {'ndvi', 'b11', 'b12', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', 'b8a'}
 AE_FEATURES = {f'A{i:02d}' for i in range(64)}
@@ -53,7 +53,7 @@ PRESTO_FEATURES = {f'emb_{k}' for k in range(128)}
 
 
 def _static_cols(use_presto: bool, exclude_ae: bool = False,
-                 exclude_precip: bool = True, exclude_presto: bool = False):
+                 exclude_precip: bool = False, exclude_presto: bool = False):
     """Build the static_cols list given ablation flags. Default exclude_precip=True to avoid future-value leakage."""
     cols: List[str] = []
     if use_presto and not exclude_presto:
@@ -61,7 +61,7 @@ def _static_cols(use_presto: bool, exclude_ae: bool = False,
     if not exclude_ae:
         cols += [f'A{i:02d}' for i in range(64)]
     if not exclude_precip:
-        cols += ['precip_jan_apr', 'precip_may_oct']
+        cols += ['precip_jan_apr']
     return cols
 
 
@@ -103,6 +103,7 @@ def build_experiments() -> Dict[str, dict]:
         static_cols=_static_cols(use_presto=True),
         use_presto_static=True,
         exclude_irrigation_static=True,
+        exclude_precip=True,
     )
 
     # 4. No Meteorological
@@ -112,6 +113,7 @@ def build_experiments() -> Dict[str, dict]:
         static_cols=_static_cols(use_presto=True),
         use_presto_static=True,
         exclude_irrigation_static=False,
+        exclude_precip=True,
     )
 
     # 5. No Sentinel-2
@@ -127,6 +129,15 @@ def build_experiments() -> Dict[str, dict]:
     experiments['no_alpha_earth'] = dict(
         description='Remove Alpha Earth embeddings (A00-A63)',
         dynamic_cols=list(ALL_DYNAMIC),
+        static_cols=_static_cols(use_presto=True, exclude_ae=True),
+        use_presto_static=True,
+        exclude_irrigation_static=False,
+    )
+
+    # 6b. No Alpha Earth + No Sentinel-2
+    experiments['no_ae_s2'] = dict(
+        description='Remove Alpha Earth embeddings + Sentinel-2 bands',
+        dynamic_cols=[c for c in ALL_DYNAMIC if c not in S2_FEATURES],
         static_cols=_static_cols(use_presto=True, exclude_ae=True),
         use_presto_static=True,
         exclude_irrigation_static=False,
@@ -150,7 +161,16 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 9. No Presto + No Alpha Earth
+    # 9. No Presto + No Sentinel-2 (keep Alpha Earth)
+    experiments['no_presto_s2'] = dict(
+        description='Remove Presto embeddings + Sentinel-2 bands (keep Alpha Earth)',
+        dynamic_cols=[c for c in ALL_DYNAMIC if c not in S2_FEATURES],
+        static_cols=_static_cols(use_presto=False),
+        use_presto_static=False,
+        exclude_irrigation_static=False,
+    )
+
+    # 10. No Presto + No Alpha Earth
     experiments['no_presto_ae'] = dict(
         description='Remove Presto + Alpha Earth embeddings',
         dynamic_cols=list(ALL_DYNAMIC),
@@ -159,7 +179,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 10. No Presto + No Alpha Earth + No Sentinel-2
+    # 11. No Presto + No Alpha Earth + No Sentinel-2
     experiments['no_presto_ae_s2'] = dict(
         description='Remove Presto + Alpha Earth + Sentinel-2',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in S2_FEATURES],
@@ -168,7 +188,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 11. No SSM + No Presto + No Alpha Earth + No Sentinel-2
+    # 12. No SSM + No Presto + No Alpha Earth + No Sentinel-2
     experiments['no_ssm_presto_ae_s2'] = dict(
         description='Remove SSM + Presto + Alpha Earth + Sentinel-2',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
@@ -179,7 +199,7 @@ def build_experiments() -> Dict[str, dict]:
 
     # --- Redundancy / moisture-pathway experiments ---
 
-    # 12. No SSM + No Presto (keep S2, Alpha Earth, meteo, precip) — both moisture sources removed
+    # 13. No SSM + No Presto (keep S2, Alpha Earth, meteo, precip) — both moisture sources removed
     experiments['no_ssm_no_presto'] = dict(
         description='Remove SSM + Presto (keep S2, Alpha Earth, meteo, precip)',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES],
@@ -188,7 +208,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 13. No SSM + No Presto + No S2 (keep Alpha Earth) — three moisture pathways removed
+    # 14. No SSM + No Presto + No S2 (keep Alpha Earth) — three moisture pathways removed
     experiments['no_ssm_no_presto_no_s2'] = dict(
         description='Remove SSM + Presto + S2 (keep Alpha Earth, meteo, precip)',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
@@ -197,7 +217,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 14. No SSM + No S2 (keep Presto) — Presto alone when in-situ and optical moisture gone
+    # 15. No SSM + No S2 (keep Presto) — Presto alone when in-situ and optical moisture gone
     experiments['no_ssm_no_s2'] = dict(
         description='Remove SSM + Sentinel-2 (keep Presto, Alpha Earth, meteo, precip)',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
@@ -206,7 +226,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=False,
     )
 
-    # 15. Meteo + precip only (floor) — no SSM, S2, Presto, Alpha Earth, irrigation
+    # 16. Meteo + precip only (floor) — no SSM, S2, Presto, Alpha Earth, irrigation
     experiments['meteo_precip_only'] = dict(
         description='Only meteo + precip (physical drivers baseline / floor)',
         dynamic_cols=list(METEO_FEATURES | PRECIP_FEATURES_DYN),
@@ -215,7 +235,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=True,
     )
 
-    # 16. No SSM + No precip/irrigation
+    # 17. No SSM + No precip/irrigation
     experiments['no_ssm_no_precip'] = dict(
         description='Remove SSM and all precip/irrigation features',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | PRECIP_FEATURES_DYN],
@@ -224,7 +244,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=True,
     )
 
-    # 17. No SSM + No Presto + No S2 + No irrigation (keep Alpha Earth, meteo, precip)
+    # 18. No SSM + No Presto + No S2 + No irrigation (keep Alpha Earth, meteo, precip)
     experiments['no_ssm_no_presto_no_s2_no_irrigation'] = dict(
         description='Remove SSM + Presto + S2 + irrigation (keep Alpha Earth, meteo, precip)',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
@@ -233,7 +253,7 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=True,
     )
 
-    # 18. No SSM + No Presto + No S2 + No Alpha Earth + No irrigation (meteo + precip dynamic only)
+    # 19. No SSM + No Presto + No S2 + No Alpha Earth + No irrigation (meteo + precip dynamic only)
     experiments['no_ssm_no_presto_no_s2_no_alpha_no_irrigation'] = dict(
         description='Remove SSM + Presto + S2 + Alpha Earth + irrigation (meteo + precip only)',
         dynamic_cols=[c for c in ALL_DYNAMIC if c not in SSM_FEATURES | S2_FEATURES],
@@ -242,13 +262,14 @@ def build_experiments() -> Dict[str, dict]:
         exclude_irrigation_static=True,
     )
 
-    # 19. Meteo + precip + irrigation only (no SSM, S2, Presto, Alpha Earth; no static precip)
+    # 20. Meteo + precip + irrigation only (no SSM, S2, Presto, Alpha Earth; no static precip)
     experiments['meteo_precip_irrig_only'] = dict(
         description='Only meteo + precip + irrigation (dynamic); no static precip',
         dynamic_cols=list(METEO_FEATURES | PRECIP_FEATURES_DYN),
         static_cols=[],
         use_presto_static=False,
         exclude_irrigation_static=False,
+
     )
 
     return experiments
@@ -312,7 +333,11 @@ def compute_extra_metrics(y_pred: np.ndarray, y_true: np.ndarray) -> Dict[str, f
 # Visualisation helpers
 # ---------------------------------------------------------------------------
 
-def create_sensitivity_bar_chart(summary_df: pd.DataFrame, output_dir: Path):
+def create_sensitivity_bar_chart(
+    summary_df: pd.DataFrame,
+    output_dir: Path,
+    suptitle: Optional[str] = None,
+):
     """Grouped bar chart comparing mean metrics across experiments."""
 
     experiments = summary_df['experiment'].values
@@ -377,7 +402,8 @@ def create_sensitivity_bar_chart(summary_df: pd.DataFrame, output_dir: Path):
     ax.axhline(0, color='k', linewidth=0.8)
     ax.grid(axis='y', alpha=0.3)
 
-    plt.suptitle('Feature Sensitivity Analysis – Leave-One-Station-Out CV', fontsize=14, fontweight='bold')
+    _st = suptitle or 'Feature Sensitivity Analysis – Leave-One-Station-Out CV'
+    plt.suptitle(_st, fontsize=14, fontweight='bold')
     plt.tight_layout()
     save_path = output_dir / 'sensitivity_bar_chart.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -444,7 +470,11 @@ def create_loss_curves(all_histories: Dict[str, List[Dict]], output_dir: Path):
     print(f"Loss curves saved to: {save_path}")
 
 
-def create_delta_chart(summary_df: pd.DataFrame, output_dir: Path):
+def create_delta_chart(
+    summary_df: pd.DataFrame,
+    output_dir: Path,
+    context_label: Optional[str] = None,
+):
     """Show the change in R² relative to baseline for each ablation."""
     baseline_rows = summary_df.loc[summary_df['experiment'] == 'baseline', 'r2_mean'].values
     if len(baseline_rows) == 0:
@@ -465,7 +495,10 @@ def create_delta_chart(summary_df: pd.DataFrame, output_dir: Path):
     ax.set_yticks(x)
     ax.set_yticklabels(ablations['experiment'].values, fontsize=9)
     ax.set_xlabel('Delta R² (relative to baseline)')
-    ax.set_title(f'Impact of Removing Feature Groups (Baseline R² = {baseline_r2:.3f})')
+    prefix = f'{context_label} — ' if context_label else ''
+    ax.set_title(
+        f'{prefix}Impact of Removing Feature Groups (Baseline R² = {baseline_r2:.3f})'
+    )
     ax.axvline(0, color='k', linewidth=0.8)
     ax.grid(axis='x', alpha=0.3)
 
@@ -506,6 +539,11 @@ def parse_args():
         default=15,
         metavar='N',
         help='Sequence length for LSTM input (default: 15). Outputs go to outputs/sensitivity/seq<N>/',
+    )
+    parser.add_argument(
+    '--no-doy',
+    action='store_true',
+    help='Disable DOY temporal features (doy_sin, doy_cos) for all experiments.',
     )
     return parser.parse_args()
 
@@ -556,7 +594,7 @@ def main():
         config.use_presto_static = exp_cfg['use_presto_static']
         config.output_dir = str(output_root / exp_name)
         # Drop temporal features only for the baseline_no_doy experiment
-        if exp_name == 'baseline_no_doy':
+        if exp_name == 'baseline_no_doy'or getattr(args, 'no_doy', False):
             config.add_temporal = False
 
         # Store the irrigation flag so FeatureConfig picks it up
@@ -643,9 +681,11 @@ def main():
     print("=" * 100)
 
     # ----- Plots -----
-    create_loss_curves(all_histories, output_root)
-    create_sensitivity_bar_chart(summary, output_root)
-    create_delta_chart(summary, output_root)
+    # Only create global plots when running the full sensitivity set.
+    if len(experiments) == len(all_experiments):
+        create_loss_curves(all_histories, output_root)
+        create_sensitivity_bar_chart(summary, output_root)
+        create_delta_chart(summary, output_root)
 
     log.info("Sensitivity analysis complete!")
     return results_df, summary

@@ -168,8 +168,10 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
+        epoch_penalty = 0.0
+        epoch_envs = 0
         
-        for x_d, x_s, y in train_loader:
+        for x_d, x_s, y, g in train_loader:
             # Move to device
             x_d = x_d.to(self.device)
             x_s = x_s.to(self.device)
@@ -181,7 +183,26 @@ class Trainer:
             
             # Use last timestep of target for loss
             y_last = y[:, -1:] if y.dim() > 1 else y.unsqueeze(1)
-            loss = self.criterion(pred, y_last)
+
+            vrex_w = getattr(self.config, 'vrex_weight', 0.0) or 0.0
+            if vrex_w > 0:
+                # V-REx (Krueger et al. 2021): minimise mean risk + beta * Var over
+                # environments of their mean risks.  Environments are site x year and
+                # come from the training split only - the held-out site is never seen.
+                per_sample = ((pred - y_last) ** 2).mean(dim=1)
+                loss_mean = per_sample.mean()
+                g_dev = g.to(self.device)
+                envs = torch.unique(g_dev)
+                if envs.numel() > 1:
+                    env_risks = torch.stack([per_sample[g_dev == e].mean() for e in envs])
+                    penalty = env_risks.var(unbiased=False)
+                else:
+                    penalty = torch.zeros((), device=per_sample.device)
+                loss = loss_mean + vrex_w * penalty
+                epoch_penalty += float(penalty.detach())
+                epoch_envs += int(envs.numel())
+            else:
+                loss = self.criterion(pred, y_last)
             
             # Backward pass
             loss.backward()
@@ -197,6 +218,10 @@ class Trainer:
             
             total_loss += loss.item()
             num_batches += 1
+
+        if getattr(self.config, 'vrex_weight', 0.0) and num_batches:
+            logger.debug(f"  V-REx: mean penalty={epoch_penalty/num_batches:.6f}, "
+                         f"mean envs/batch={epoch_envs/num_batches:.1f}")
         
         return total_loss / num_batches
     
@@ -219,7 +244,7 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         
-        for x_d, x_s, y in val_loader:
+        for x_d, x_s, y, g in val_loader:
             x_d = x_d.to(self.device)
             x_s = x_s.to(self.device)
             y = y.to(self.device)

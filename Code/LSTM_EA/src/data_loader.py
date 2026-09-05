@@ -74,6 +74,58 @@ def _add_annual_precip_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _add_swi_api_channels(df: pd.DataFrame, taus, logger) -> pd.DataFrame:
+    """
+    D1: add SWI_T and API_T channels for each characteristic timescale T (days).
+
+    SWI is the Wagner et al. (1999) exponential filter on surface soil moisture:
+        K_n   = K_{n-1} / (K_{n-1} + exp(-dt / T))
+        SWI_n = SWI_{n-1} + K_n * (SSM_n - SWI_{n-1})
+    API is the standard antecedent precipitation index:
+        API_n = API_{n-1} * exp(-dt / T) + P_n
+
+    Both use the real day gap dt between consecutive rows, so a break in the record
+    decays the state rather than treating the rows as adjacent.  NaN SSM carries the
+    state forward without updating.  Called BEFORE the month filter so the recursion
+    runs on the continuous daily record instead of restarting each April - which is
+    what makes the T=60 channel meaningful.
+    """
+    ssm_col = 'SSM_avg' if 'SSM_avg' in df.columns else ('SSM' if 'SSM' in df.columns else None)
+    p_col = next((c for c in PRECIP_COLS if c in df.columns), None)
+    if ssm_col is None and p_col is None:
+        logger.warning("SWI/API requested but neither SSM nor precip columns found")
+        return df
+
+    dates = pd.to_datetime(df['Date'])
+    dt = dates.diff().dt.days.fillna(1.0).clip(lower=1.0).to_numpy()
+    ssm = df[ssm_col].to_numpy(dtype=float) if ssm_col else None
+    prcp = pd.to_numeric(df[p_col], errors='coerce').fillna(0.0).to_numpy(dtype=float) if p_col else None
+
+    for T in taus:
+        if ssm is not None:
+            swi = np.full(len(df), np.nan)
+            state, K = np.nan, 1.0
+            for i in range(len(df)):
+                if np.isnan(state):
+                    if not np.isnan(ssm[i]):
+                        state, K = ssm[i], 1.0
+                elif not np.isnan(ssm[i]):
+                    K = K / (K + np.exp(-dt[i] / T))
+                    state = state + K * (ssm[i] - state)
+                swi[i] = state
+            df[f'swi_{T}'] = swi
+        if prcp is not None:
+            api = np.zeros(len(df))
+            state = 0.0
+            for i in range(len(df)):
+                state = state * np.exp(-dt[i] / T) + prcp[i]
+                api[i] = state
+            df[f'api_{T}'] = api
+    logger.info(f"  Added SWI/API channels for T={list(taus)} "
+                f"(ssm={ssm_col}, precip={p_col})")
+    return df
+
+
 class DataProcessor:
     """
     Handles all data loading, cleaning, and windowing operations.
@@ -168,8 +220,12 @@ class DataProcessor:
             
             # Validate required columns (exclude irrigation, computed precip, and Presto emb_* merged later)
             computed_static = {'precip_jan_apr', 'precip_may_oct'}
+            # swi_*/api_* are derived in-loader (D1), so exempt them from the input check
+            computed_dynamic = {c for c in dynamic_cols
+                                if c.startswith('swi_') or c.startswith('api_')}
             base_static = [c for c in static_cols if c not in computed_static and not (c.startswith('emb_'))]
-            base_required = [col for col in self.feature_config.dynamic_cols if col != 'irrigation'] + base_static + [target_col, 'Date']
+            base_required = [col for col in self.feature_config.dynamic_cols
+                             if col != 'irrigation' and col not in computed_dynamic] + base_static + [target_col, 'Date']
             missing_cols = set(base_required) - set(df.columns)
             if missing_cols:
                 logger.error(f"Missing columns in {filepath}: {missing_cols}")
@@ -197,6 +253,10 @@ class DataProcessor:
             # Add Year and accumulated precipitation (from full-year data) before month filter
             df['Year'] = df['Date'].dt.year
             df = _add_annual_precip_features(df)
+
+            # D1: SWI/API on the continuous record, before the month filter
+            if getattr(self.data_config, 'swi_api_taus', None):
+                df = _add_swi_api_channels(df, self.data_config.swi_api_taus, logger)
 
             # Optional: restrict to a range of months (e.g. May–October)
             if self.data_config.month_range is not None:
@@ -363,6 +423,7 @@ class DataProcessor:
         all_windows = []
         all_dates = []  # last date of each window (target date)
         skipped_year = 0
+        skipped_gap = 0
         skipped_nan = 0
         skipped_target_nan = 0
         interpolated_count = 0
@@ -374,6 +435,14 @@ class DataProcessor:
             if self.data_config.same_year_constraint and window['Year'].nunique() > 1:
                 skipped_year += 1
                 continue
+
+            # A4: the slice above is positional, so a gap in the daily record yields a
+            # window covering more calendar days than seq_length.  Require contiguity.
+            if getattr(self.data_config, 'require_contiguous_windows', False):
+                span = (window['Date'].iloc[-1] - window['Date'].iloc[0]).days + 1
+                if span != seq_length:
+                    skipped_gap += 1
+                    continue
             
             # Drop window if target has any NaN (no interpolation for target)
             if window[target_col].isna().any():
@@ -432,6 +501,22 @@ class DataProcessor:
             # Extract features and target (target is raw, never interpolated)
             try:
                 X_dynamic = window_interpolated[dynamic_cols].values  # (seq_length, num_dyn_features)
+
+                # D2: extend the dynamic tensor backwards to context_length timesteps.
+                # Acceptance of this window was already decided above on the prediction
+                # window alone, so n is unchanged.  History is restricted to the same
+                # calendar year and left-padded with zeros; the frame is already scaled
+                # at this point, so zero == the training mean, not a spurious extreme.
+                ctx_len = getattr(self.data_config, 'context_length', None)
+                if ctx_len and ctx_len > seq_length:
+                    lo = max(0, i - (ctx_len - seq_length))
+                    hist = df.iloc[lo:i + seq_length]
+                    hist = hist[hist['Year'] == window['Year'].iloc[-1]]
+                    Xh = hist[dynamic_cols].to_numpy(dtype=float)
+                    Xh = np.nan_to_num(Xh, nan=0.0)
+                    if len(Xh) < ctx_len:
+                        Xh = np.vstack([np.zeros((ctx_len - len(Xh), Xh.shape[1])), Xh])
+                    X_dynamic = Xh[-ctx_len:]
                 y = window[target_col].values  # (seq_length,) - use raw target, no interpolation
                 if use_presto:
                     year = int(window_interpolated['Year'].iloc[0])
@@ -455,9 +540,12 @@ class DataProcessor:
                 else:
                     X_static = X_static_base
                 
-                # Validate shapes
-                if X_dynamic.shape != (seq_length, len(dynamic_cols)):
-                    logger.warning(f"Unexpected dynamic feature shape: {X_dynamic.shape}")
+                # Validate shapes.  Under D2 the dynamic tensor legitimately carries
+                # context_length timesteps while the static tensor keeps seq_length.
+                expected_dyn_len = ctx_len if (ctx_len and ctx_len > seq_length) else seq_length
+                if X_dynamic.shape != (expected_dyn_len, len(dynamic_cols)):
+                    logger.warning(f"Unexpected dynamic feature shape: {X_dynamic.shape}, "
+                                   f"expected ({expected_dyn_len}, {len(dynamic_cols)})")
                     continue
                 expected_static_dim = X_static_base.shape[1] + (1 if irrigation_as_static else 0)
                 if X_static.shape != (seq_length, expected_static_dim):
@@ -481,6 +569,8 @@ class DataProcessor:
             logger.info(f"  Skipped {skipped_year} windows (different years)")
         if skipped_target_nan > 0:
             logger.info(f"  Skipped {skipped_target_nan} windows (target had NaN)")
+        if skipped_gap > 0:
+            logger.info(f"  Skipped {skipped_gap} windows (non-contiguous dates, span != {seq_length}d)")
         if skipped_nan > 0:
             logger.info(f"  Skipped {skipped_nan} windows (features NaN > {nan_threshold*100:.0f}%)")
         if interpolated_count > 0:
@@ -657,8 +747,18 @@ class DataProcessor:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 # Fill NaN in static (e.g. Presto merge misses) so scaler.transform does not fail
                 if static_cols_for_scaling:
-                    static_vals = df[static_cols_for_scaling].fillna(0.0)
-                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    n_nan = int(df[static_cols_for_scaling].isna().sum().sum())
+                    if getattr(self.data_config, 'impute_statics_after_scaling', False):
+                        # A3: scale first (StandardScaler propagates NaN), then fill with 0
+                        # in z-space, i.e. the training mean rather than an arbitrary z-score.
+                        scaled = self.scaler_stat.transform(df[static_cols_for_scaling])
+                        df_scaled[static_cols_for_scaling] = np.nan_to_num(scaled, nan=0.0)
+                    else:
+                        static_vals = df[static_cols_for_scaling].fillna(0.0)
+                        df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    if n_nan:
+                        logger.info(f"  Static NaNs imputed: {n_nan} "
+                                    f"({'after' if getattr(self.data_config, 'impute_statics_after_scaling', False) else 'before'} scaling)")
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)
@@ -687,8 +787,18 @@ class DataProcessor:
                 if irrigation_as_static and 'irrigation' in df.columns:
                     static_cols_for_scaling = static_cols + ['irrigation']
                 if static_cols_for_scaling:
-                    static_vals = df[static_cols_for_scaling].fillna(0.0)
-                    df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    n_nan = int(df[static_cols_for_scaling].isna().sum().sum())
+                    if getattr(self.data_config, 'impute_statics_after_scaling', False):
+                        # A3: scale first (StandardScaler propagates NaN), then fill with 0
+                        # in z-space, i.e. the training mean rather than an arbitrary z-score.
+                        scaled = self.scaler_stat.transform(df[static_cols_for_scaling])
+                        df_scaled[static_cols_for_scaling] = np.nan_to_num(scaled, nan=0.0)
+                    else:
+                        static_vals = df[static_cols_for_scaling].fillna(0.0)
+                        df_scaled[static_cols_for_scaling] = self.scaler_stat.transform(static_vals)
+                    if n_nan:
+                        logger.info(f"  Static NaNs imputed: {n_nan} "
+                                    f"({'after' if getattr(self.data_config, 'impute_statics_after_scaling', False) else 'before'} scaling)")
                 df_scaled[target_col] = self.scaler_y.transform(df[[target_col]])
                 
                 out = self.create_sliding_windows(df_scaled, dynamic_cols, static_cols, target_col, return_dates=True)
@@ -706,7 +816,27 @@ class DataProcessor:
         if not X_d_test_list:
             raise ValueError("No valid test samples created!")
         
+        # Environment ids for group-wise objectives (V-REx, and later E1/D3).
+        # One id per window: site x calendar year of the window's target date.
+        def _groups(files, dates_list):
+            labels = []
+            for fp, dts in zip(files, dates_list):
+                site = _site_from_filepath(fp) or Path(fp).stem
+                labels.extend(f"{site}_{pd.Timestamp(d).year}" for d in dts)
+            return labels
+
+        train_labels = _groups(train_files, dates_train_list)
+        test_labels = _groups(test_files, dates_test_list)
+        vocab = {g: i for i, g in enumerate(sorted(set(train_labels) | set(test_labels)))}
+        groups_train = np.array([vocab[g] for g in train_labels], dtype=np.int64)
+        groups_test = np.array([vocab[g] for g in test_labels], dtype=np.int64)
+        logger.info(f"Environments (site x year): {len(set(train_labels))} in train, "
+                    f"{len(set(test_labels))} in test")
+
         result = {
+            'groups_train': groups_train,
+            'groups_test': groups_test,
+            'group_vocab': vocab,
             'X_d_train': np.concatenate(X_d_train_list),
             'X_s_train': np.concatenate(X_s_train_list),
             'y_train': np.concatenate(y_train_list),
@@ -744,7 +874,8 @@ class RZSMDataset(Dataset):
         Target values, shape (num_samples, seq_length)
     """
     
-    def __init__(self, x_d: np.ndarray, x_s: np.ndarray, y: np.ndarray):
+    def __init__(self, x_d: np.ndarray, x_s: np.ndarray, y: np.ndarray,
+                 groups: np.ndarray = None):
         if len(x_d) == 0 or len(x_s) == 0 or len(y) == 0:
             raise ValueError("Cannot create dataset from empty arrays")
         
@@ -754,6 +885,10 @@ class RZSMDataset(Dataset):
         self.x_d = torch.tensor(x_d, dtype=torch.float32)
         self.x_s = torch.tensor(x_s, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        # Environment id per sample; zeros when the caller supplies none, so the
+        # 4-tuple contract holds everywhere regardless of objective.
+        self.groups = (torch.zeros(len(y), dtype=torch.long) if groups is None
+                       else torch.as_tensor(np.asarray(groups), dtype=torch.long))
         
         # Check for NaN or Inf
         if torch.isnan(self.x_d).any() or torch.isinf(self.x_d).any():
@@ -771,7 +906,7 @@ class RZSMDataset(Dataset):
     def __len__(self) -> int:
         return len(self.y)
     
-    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.x_d[i], self.x_s[i], self.y[i]
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.x_d[i], self.x_s[i], self.y[i], self.groups[i]
 
 
